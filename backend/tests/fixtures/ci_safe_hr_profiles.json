@@ -1,0 +1,23 @@
+[
+  {
+    "email": "recruiter@talkdesk.com",
+    "name": "Recruiter",
+    "company": "Talkdesk",
+    "note": "Regression guard: must never match synthetic_hr_cleanup patterns"
+  },
+  {
+    "email": "talent@unacademy.com",
+    "name": "HR Partner",
+    "company": "Unacademy"
+  },
+  {
+    "email": "hiring@xactlycorp.com",
+    "name": "Hiring",
+    "company": "Xactly"
+  },
+  {
+    "email": "x_user@exactlycorp.com",
+    "name": "Alex",
+    "company": "Exactlycorp"
+  }
+]
