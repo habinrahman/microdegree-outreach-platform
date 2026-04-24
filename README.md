@@ -4,7 +4,7 @@
 
 The codebase is engineered for **controlled pilots**: explicit env kill-switches, lifecycle FSMs on `email_campaigns`, idempotent worker claims, fixture isolation in CI, and extensive runbooks under `docs/`.
 
-> **Data & privacy:** This repository does **not** ship real student or HR data. Production databases, OAuth tokens, `credentials.json` / service accounts, and exports are **operator-owned** and must stay out of git (see `.gitignore`). The ORM includes `is_demo` and `include_demo` query flags so UIs can hide synthetic rows. **Google Sheets** integration expects a workbook + service account on the deployment side (`app/services/google_sheets.py` contains a placeholder spreadsheet key for the original deployment—replace for your environment).
+> **Data & privacy:** This repository does **not** ship real student or HR data. Production databases, OAuth tokens, `credentials.json` / service accounts, and exports are **operator-owned** and must stay out of git (see `.gitignore`). The ORM includes `is_demo` and `include_demo` query flags so UIs can hide synthetic rows. **Google Sheets** mirror reads **`GOOGLE_SHEETS_SPREADSHEET_ID`** and a service-account JSON path from env (see `backend/.env.example`); do not commit real workbook IDs or keys if the repo is public.
 
 ---
 
@@ -393,7 +393,7 @@ Binds **8010** per `docker-compose.yml`. Provide `backend/.env` with required va
 
 - Create Google Cloud **OAuth Web client** credentials → `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`.  
 - Authorized redirect: `http://127.0.0.1:8010/oauth/gmail/callback` (and production URL when deployed).  
-- Sheets: place service account JSON as `credentials.json` in **`backend/`** working directory (default `google_sheets.py` path) and grant sheet access — **never commit** this file.
+- Sheets: set **`GOOGLE_SHEETS_SPREADSHEET_ID`**; place service account JSON (path via **`GOOGLE_SHEETS_CREDENTIALS_PATH`** or **`GOOGLE_APPLICATION_CREDENTIALS`**, else `credentials.json` in **`backend/`**) — **never commit** this file.
 
 ---
 
@@ -455,6 +455,8 @@ Values are documented inline in **`backend/.env.example`**. Grouped index:
 
 | Variable | Role |
 |----------|------|
+| `GOOGLE_SHEETS_SPREADSHEET_ID` | **Required** for sheet open/sync: spreadsheet document ID from the URL. |
+| `GOOGLE_SHEETS_CREDENTIALS_PATH` | Optional path to service account JSON; falls back to `GOOGLE_APPLICATION_CREDENTIALS`, then `credentials.json`. |
 | `SHEET_SYNC_WARN_MINUTES`, `SHEET_SYNC_CRIT_MINUTES`, `SHEET_SYNC_STUCK_MINUTES` | Health thresholds for pending export age / stuck detector. |
 
 ### Observability & SRE
@@ -620,8 +622,9 @@ This is not a demo CRUD app: it is a **small distributed system** compressed int
 1. Open an issue or draft PR describing the change (operator-facing behavior deserves a runbook note).  
 2. Run **`pytest`** and relevant **`npm test`** / **`npm run lint`**.  
 3. Follow existing patterns: router thin, logic in `services/`, transitions only via `campaign_lifecycle` where applicable.  
-4. Never commit secrets, real exports, or production URLs with tokens.  
-5. Update **`backend/.env.example`** when adding env vars.
+4. Install pre-commit hooks: **`pip install pre-commit && pre-commit install`** (includes a Gitleaks secret scan).  
+5. Never commit secrets, real exports, or production URLs with tokens. If you suspect a leak, rotate the secret and follow `SECURITY.md`.  
+6. Update **`backend/.env.example`** when adding env vars.
 
 ---
 
