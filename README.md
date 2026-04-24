@@ -630,7 +630,8 @@ This is not a demo CRUD app: it is a **small distributed system** compressed int
 
 ## 16. License
 
-**License TBD** — replace this section with your chosen SPDX license (e.g. MIT, Apache-2.0) and add a `LICENSE` file before public launch.
+**## License
+Licensed under the MIT License. See LICENSE.
 
 ---
 
