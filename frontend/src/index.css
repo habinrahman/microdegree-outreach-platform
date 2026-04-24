@@ -1,0 +1,114 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 220 20% 98%;
+    --foreground: 240 10% 3.9%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 240 10% 3.9%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 240 10% 3.9%;
+
+    --primary: 221 83% 53%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 240 4.8% 95.9%;
+    --secondary-foreground: 240 5.9% 10%;
+
+    --muted: 240 4.8% 95.9%;
+    --muted-foreground: 240 3.8% 46.1%;
+
+    --accent: 240 4.8% 95.9%;
+    --accent-foreground: 240 5.9% 10%;
+
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 0 0% 100%;
+
+    --success: 142 71% 45%;
+    --success-foreground: 0 0% 100%;
+
+    --border: 240 5.9% 90%;
+    --input: 220 20% 96%;
+    --ring: 221 83% 63%;
+
+    --radius: 0.75rem;
+
+    --sidebar-background: 240 10% 4%;
+    --sidebar-foreground: 210 20% 88%;
+    --sidebar-foreground-active: 0 0% 100%;
+    --sidebar-active-bg: 221 83% 53%;
+    --sidebar-primary: 221 83% 53%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 240 3.7% 15.9%;
+    --sidebar-accent-foreground: 210 20% 88%;
+    --sidebar-border: 240 3.7% 15.9%;
+    --sidebar-ring: 221 83% 63%;
+
+    --shadow-card: 0 0 0 1px rgba(0,0,0,0.05), 0 1px 3px 0 rgba(0,0,0,0.03);
+    --shadow-card-hover: 0 0 0 1px rgba(0,0,0,0.05), 0 4px 6px -1px rgba(0,0,0,0.05), 0 2px 4px -2px rgba(0,0,0,0.05);
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+    font-size: 0.875rem;
+    line-height: 1.5;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    text-wrap: balance;
+  }
+
+  p {
+    text-wrap: pretty;
+  }
+}
+
+@layer components {
+  .card-shadow {
+    box-shadow: var(--shadow-card);
+    transition: box-shadow 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  .card-shadow:hover {
+    box-shadow: var(--shadow-card-hover);
+  }
+
+  .input-focus {
+    @apply transition-shadow duration-150 ease-in-out;
+    box-shadow: inset 0 0 0 1px hsl(var(--border));
+  }
+  .input-focus:focus {
+    box-shadow: inset 0 0 0 1px hsl(var(--ring)), 0 0 0 3px hsla(221, 83%, 53%, 0.1);
+    outline: none;
+  }
+
+  .sidebar-nav-item {
+    @apply flex items-center gap-3 px-4 py-2.5 rounded-md text-sm transition-colors duration-150;
+    color: hsl(var(--sidebar-foreground));
+  }
+  .sidebar-nav-item:hover {
+    background-color: rgba(255, 255, 255, 0.05);
+  }
+  .sidebar-nav-item.active {
+    color: hsl(var(--sidebar-foreground-active));
+    background-color: hsla(221, 83%, 53%, 0.1);
+    font-weight: 500;
+  }
+}
