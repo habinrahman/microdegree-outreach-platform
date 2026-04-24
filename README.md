@@ -1,3 +1,21 @@
+fastapi
+react
+python
+automation
+workflow-engine
+distributed-systems
+platform-engineering
+scheduler
+observability
+reliability-engineering
+email-automation
+campaign-management
+crm
+backend
+state-machines
+analytics
+postgresql
+devops
 # MicroDegree Outreach — Placement Outreach Automation Platform
 
 **MicroDegree Outreach** is an internal-grade **placement / HR outreach automation** system: it models students and HR contacts, assigns outreach pairs, generates **sequenced email campaigns** (initial + timed follow-ups), runs an **APScheduler**-driven send pipeline (Gmail API with SMTP fallback), **detects replies** over IMAP/Gmail monitoring, classifies outcomes, exports a **mirror** to **Google Sheets**, and exposes a **React operator console** with analytics, admin tools, and **SRE-style reliability** surfaces.
