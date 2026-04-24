@@ -1,21 +1,12 @@
-fastapi
-react
-python
-automation
-workflow-engine
-distributed-systems
-platform-engineering
-scheduler
-observability
-reliability-engineering
-email-automation
-campaign-management
-crm
-backend
-state-machines
-analytics
-postgresql
-devops
+![Python](https://img.shields.io/badge/Python-3.12-blue)
+![FastAPI](https://img.shields.io/badge/FastAPI-Backend-green)
+![React](https://img.shields.io/badge/React-Frontend-blue)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-Database-blue)
+![Docker](https://img.shields.io/badge/Docker-Containerized-blue)
+![APScheduler](https://img.shields.io/badge/APScheduler-Orchestration-orange)
+![Observability](https://img.shields.io/badge/Observability-Built--In-purple)
+![Status](https://img.shields.io/badge/Status-Production--Style-success)
+
 # MicroDegree Outreach — Placement Outreach Automation Platform
 
 **MicroDegree Outreach** is an internal-grade **placement / HR outreach automation** system: it models students and HR contacts, assigns outreach pairs, generates **sequenced email campaigns** (initial + timed follow-ups), runs an **APScheduler**-driven send pipeline (Gmail API with SMTP fallback), **detects replies** over IMAP/Gmail monitoring, classifies outcomes, exports a **mirror** to **Google Sheets**, and exposes a **React operator console** with analytics, admin tools, and **SRE-style reliability** surfaces.
