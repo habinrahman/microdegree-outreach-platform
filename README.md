@@ -630,7 +630,7 @@ This is not a demo CRUD app: it is a **small distributed system** compressed int
 
 ## 16. License
 
-**## License
+**License
 Licensed under the MIT License. See LICENSE.
 
 ---
