@@ -1,0 +1,12 @@
+# Gitleaks allowlist — keep tight; extend only for known false positives.
+title = "placement-outreach-system"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Non-secret test fixtures and documentation examples"
+paths = [
+  '''^backend/tests/test_backup_pg_restore_verify\.py$''',
+  '''^docs/DISASTER_RECOVERY_RUNBOOK\.md$''',
+]

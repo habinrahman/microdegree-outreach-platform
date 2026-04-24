@@ -193,3 +193,12 @@ docs/_build/
 .python-version
 celerybeat-schedule
 celerybeat.pid
+frontend/dist/
+frontend/dist - Copy/
+frontend/src - Copy/
+backend/resumes/
+backend/credentials.json
+*.pem
+*.key
+.env
+backend/.env
