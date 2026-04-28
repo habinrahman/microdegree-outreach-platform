@@ -142,12 +142,49 @@ async def lifespan(app: FastAPI):
         from app.database import init_db
 
         await asyncio.to_thread(init_db)
+        init_ok = True
     except Exception as e:
         # Log and continue: init_db itself treats OperationalError as soft-failure; other errors still surface per-route.
         logger.exception("Database initialization failed: %s", e)
+        init_ok = False
+
+    # Env validation (fail-fast on deployment drift).
+    # Sheets: placeholder spreadsheet IDs and Windows credential paths on Linux must be caught before scheduler runs.
+    try:
+        from app.services.google_sheets import validate_sheets_env
+
+        # Strict format checks only (no network) to keep startup fast.
+        validate_sheets_env(require_access=False)
+    except Exception as e:
+        if is_production_runtime():
+            raise
+        logger.warning("Google Sheets env validation skipped (dev): %s", e)
+
+    # Cold-start safety: default to outbound disabled until an operator explicitly enables it.
+    # If runtime_settings is unavailable, treat as unsafe and do not start scheduler in production.
+    try:
+        if os.getenv("SAFE_STARTUP_DISABLE_OUTBOUND", "").strip().lower() not in ("0", "false", "no"):
+            from app.database.config import SessionLocal
+            from app.services.runtime_settings_store import set_outbound_enabled
+
+            def _disable_outbound():
+                db = SessionLocal()
+                try:
+                    set_outbound_enabled(db, False)
+                finally:
+                    db.close()
+
+            await asyncio.to_thread(_disable_outbound)
+            logger.info("Cold-start safety: outbound_enabled forced false at startup")
+    except Exception as e:
+        if is_production_runtime():
+            raise RuntimeError("Cold-start safety failed: cannot force outbound_enabled=false") from e
+        logger.warning("Cold-start safety outbound disable skipped (dev): %s", e)
 
     try:
-        if os.getenv("DISABLE_SCHEDULER", "").strip().lower() in ("1", "true", "yes"):
+        if not init_ok:
+            logger.warning("Scheduler not started: DB init failed")
+        elif os.getenv("DISABLE_SCHEDULER", "").strip().lower() in ("1", "true", "yes"):
             logger.warning("Scheduler disabled by DISABLE_SCHEDULER=1")
         else:
             start_scheduler()
