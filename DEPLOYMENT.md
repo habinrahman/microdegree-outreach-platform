@@ -42,3 +42,32 @@ For local dev:
 
 For Postgres production backups, use your platform tools (Supabase backups) or `pg_dump`. Operator scripts, restore drills, and PITR guidance: `docs/DISASTER_RECOVERY_RUNBOOK.md`. Dashboard: `GET /admin/backup-health`. Observability / SRE: `docs/SRE_ARCHITECTURE.md`, `GET /admin/reliability`, dashboard route `/system-reliability`. Security: `docs/SECURITY_AUDIT.md`, `docs/SECURITY_CHECKLIST.md`. **Launch gate (principal-engineer review):** `docs/PRODUCTION_READINESS_REVIEW.md`.
 
+### Alembic migrations on Supabase (lock / timeout pitfalls)
+
+Supabase connection poolers (e.g. Supavisor / PgBouncer endpoints) plus long-lived app transactions can cause
+even “metadata-only” DDL (like `ALTER TABLE ... SET DEFAULT`) to hang waiting on locks or hit aggressive
+statement timeouts.
+
+- **Best practice**
+  - Use a **direct Postgres connection** for migrations when possible (port `5432`, not the transaction pooler).
+  - Run migrations while the API / scheduler is stopped (or at least ensure no sessions are `idle in transaction`).
+
+- **Safe investigation commands**
+  - `alembic current -v`
+  - `alembic heads`
+  - Inspect DB directly:
+    - `SELECT version_num FROM alembic_version;`
+    - Check the intended schema state via `information_schema.columns`.
+
+- **Bypassing a blocked “default-only” migration**
+  - If a migration only changes a column default (no data backfill, no constraints), it can be safe to **bypass**
+    by advancing the recorded revision **after verifying the schema is already acceptable for your app**.
+  - Preferred: `alembic stamp <revision>`
+  - **Last resort (ops escape hatch):** `UPDATE alembic_version SET version_num = '<revision>';`
+
+- **Rollback strategy**
+  - If you only stamped/updated `alembic_version` (no schema change), rollback is simply:
+    - `alembic stamp <previous_revision>` (or update the row back), then re-run `alembic upgrade head`.
+  - If schema changes were applied, rollback must use the corresponding Alembic `downgrade` or a new forward
+    repair migration (append-only discipline).
+

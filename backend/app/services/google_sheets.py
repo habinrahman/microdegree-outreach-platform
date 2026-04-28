@@ -33,6 +33,19 @@ def _spreadsheet_id() -> str:
             "Set it to your Google Sheet document ID (from the URL). "
             "Do not commit credentials or IDs you consider private—use env / secrets manager."
         )
+    # Fail fast on placeholders / obvious misconfig.
+    # Common operator error: leaving a template ID in backend/.env that overrides root .env.
+    if sid == "1AbCdEfGHiJkLmNoPqRsTuVwXyZ01234567890" or "01234567890" in sid or sid.startswith("1AbCdEf"):
+        raise RuntimeError(
+            "GOOGLE_SHEETS_SPREADSHEET_ID looks like a placeholder. "
+            "Set it to the real spreadsheet document ID (from the Google Sheets URL)."
+        )
+    # Basic format check (Google sheet IDs are URL-safe base64-ish tokens).
+    if len(sid) < 20 or not all(ch.isalnum() or ch in "-_" for ch in sid):
+        raise RuntimeError(
+            "GOOGLE_SHEETS_SPREADSHEET_ID is set but has an invalid format. "
+            "Expected a URL-safe token (letters/numbers/-/_), length >= 20."
+        )
     return sid
 
 
@@ -42,7 +55,29 @@ def _credentials_path() -> str:
         or (os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or "").strip()
         or "credentials.json"
     )
+    # Linux portability: Windows-style absolute paths break on droplet.
+    # Fail fast in non-Windows runtimes so misconfig is caught immediately.
+    if os.name != "nt":
+        if ":" in raw[:3] or "\\" in raw:
+            raise RuntimeError(
+                "Google Sheets credentials path looks Windows-specific. "
+                "Set GOOGLE_SHEETS_CREDENTIALS_PATH to a Linux path on the droplet "
+                "(e.g. /opt/placement-outreach/credentials.json)."
+            )
     return raw if raw else "credentials.json"
+
+
+def validate_sheets_env(*, require_access: bool = False) -> dict:
+    """
+    Deployment sanity check (best-effort). When require_access=True, performs a network call.
+    """
+    sid = _spreadsheet_id()
+    cp = _credentials_path()
+    out = {"spreadsheet_id": sid, "credentials_path": cp}
+    if require_access:
+        ss = open_spreadsheet()
+        out["spreadsheet_title"] = getattr(ss, "title", None)
+    return out
 
 
 def _authorize_client():
