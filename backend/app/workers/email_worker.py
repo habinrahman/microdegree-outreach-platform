@@ -20,6 +20,7 @@ from app.services.deliverability_layer import evaluate_deliverability_for_send
 from app.services.runtime_settings_store import get_outbound_enabled
 from app.services.outbound_suppression_store import is_suppressed, upsert_suppression
 from app.services.pg_advisory_lock import campaign_send_lock
+from app.services.audit import log_event
 from app.services.campaign_terminal_outcomes import (
     BOUNCED as TERMINAL_BOUNCED,
     NO_RESPONSE_COMPLETED,
@@ -86,6 +87,17 @@ def process_email_campaign(campaign_id: str) -> None:
         with campaign_send_lock(db, campaign_id) as acquired:
             if not acquired:
                 logger.debug("SKIP: send lock held for %s", campaign_id)
+                try:
+                    log_event(
+                        db,
+                        actor="system",
+                        action="duplicate_send_blocked",
+                        entity_type="EmailCampaign",
+                        entity_id=str(campaign_id),
+                        meta={"reason": "pg_advisory_lock_held"},
+                    )
+                except Exception:
+                    pass
                 return
 
         # Strict pre-guard:
@@ -153,6 +165,17 @@ def process_email_campaign(campaign_id: str) -> None:
             campaign.processing_lock_acquired_at = None
             db.add(campaign)
             db.commit()
+            try:
+                log_event(
+                    db,
+                    actor="system",
+                    action="kill_switch_blocked_send",
+                    entity_type="EmailCampaign",
+                    entity_id=str(campaign.id),
+                    meta={"note": "outbound_disabled"},
+                )
+            except Exception:
+                pass
             return
 
         student = db.query(Student).filter(Student.id == campaign.student_id).first()
@@ -210,6 +233,17 @@ def process_email_campaign(campaign_id: str) -> None:
             campaign.processing_lock_acquired_at = None
             db.add(campaign)
             db.commit()
+            try:
+                log_event(
+                    db,
+                    actor="system",
+                    action="suppression_triggered",
+                    entity_type="EmailCampaign",
+                    entity_id=str(campaign.id),
+                    meta={"hr_email": hr_email, "reason": sup_reason, "source": "suppression_list"},
+                )
+            except Exception:
+                pass
             return
 
         # Safety check: if message_id already exists, this campaign has been sent before.
@@ -323,6 +357,22 @@ def process_email_campaign(campaign_id: str) -> None:
             )
 
         persist_sent_email_campaign(db, campaign)
+        try:
+            log_event(
+                db,
+                actor="system",
+                action="campaign_sent",
+                entity_type="EmailCampaign",
+                entity_id=str(campaign.id),
+                meta={
+                    "student_id": str(campaign.student_id),
+                    "hr_id": str(campaign.hr_id),
+                    "email_type": campaign.email_type,
+                    "message_id": campaign.message_id,
+                },
+            )
+        except Exception:
+            pass
 
         logger.debug("SAVED sent_at: %s %s", campaign.id, campaign.sent_at)
 

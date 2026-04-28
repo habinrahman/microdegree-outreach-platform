@@ -84,7 +84,8 @@ def ensure_runtime_settings_schema_connection(connection: Connection) -> None:
             logger.info("runtime_settings bootstrap: seeded %s=%s", key, value)
 
     _seed_if_missing(KEY_FOLLOWUPS_DISPATCH, "true")
-    _seed_if_missing(KEY_OUTBOUND_ENABLED, "true")
+    # SAFETY: outbound must be explicitly enabled by an operator.
+    _seed_if_missing(KEY_OUTBOUND_ENABLED, "false")
 
 
 def ensure_runtime_settings_schema_for_engine(engine: Engine) -> None:

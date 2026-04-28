@@ -80,4 +80,3 @@ class EmailCampaign(Base):
     overdue_late = Column(Boolean, default=False, nullable=False)
     overdue_first_seen_at = Column(DateTime, nullable=True)
     exported_sequencer_sheet = Column(Boolean, default=False, nullable=False)
-

@@ -12,6 +12,7 @@ from sqlalchemy import text
 
 from app.models.outbound_suppression import OutboundSuppression
 from app.services.outbound_suppression_bootstrap import ensure_outbound_suppression_schema_connection
+from app.services.audit import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +166,17 @@ def upsert_suppression(
         row = db.query(OutboundSuppression).filter(OutboundSuppression.email_lower == el).first()
         if row is None:
             raise RuntimeError("suppression upsert failed to persist row")
+        try:
+            log_event(
+                db,
+                actor="system",
+                action="suppression_triggered",
+                entity_type="OutboundSuppression",
+                entity_id=str(row.id),
+                meta={"email_lower": el, "reason": r, "source": s, "active": bool(active)},
+            )
+        except Exception:
+            pass
         return row
 
     # Fallback: ORM path (SQLite / dev). Best-effort; no cross-process concurrency expected.
@@ -200,5 +212,16 @@ def upsert_suppression(
         row.updated_at = now
         db.add(row)
     db.commit()
+    try:
+        log_event(
+            db,
+            actor="system",
+            action="suppression_triggered",
+            entity_type="OutboundSuppression",
+            entity_id=str(getattr(row, "id", "")),
+            meta={"email_lower": el, "reason": r, "source": s, "active": bool(active)},
+        )
+    except Exception:
+        pass
     return row
 

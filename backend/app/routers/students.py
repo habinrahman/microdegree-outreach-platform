@@ -293,11 +293,13 @@ async def upload_student_resume(
         f.write(data)
     new_rel = os.path.relpath(disk_path, start=backend_root_dir())
 
+    now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+
     if old_rel:
         st.resume_archive_path = old_rel
     st.resume_path = new_rel
     st.resume_file_name = raw_name
-    st.resume_updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    st.resume_updated_at = now_naive
 
     try:
         profile = extract_profile_from_resume_file(disk_path)
@@ -318,12 +320,23 @@ async def upload_student_resume(
             regen_n = refresh_pending_campaign_templates(db, st)
         except Exception:
             logger.exception("refresh_pending_campaign_templates failed student_id=%s", student_id)
+        try:
+            log_event(
+                db,
+                actor="system",
+                action="pending_campaigns_regenerated",
+                entity_type="Student",
+                entity_id=str(student_id),
+                meta={"count": int(regen_n)},
+            )
+        except Exception:
+            pass
 
     try:
         log_event(
             db,
             actor="operator",
-            action="student_resume_updated",
+            action="resume_uploaded",
             entity_type="Student",
             entity_id=str(student_id),
             meta={
