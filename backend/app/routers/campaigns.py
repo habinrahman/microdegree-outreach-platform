@@ -5,10 +5,11 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException
 
 from app.auth import require_api_key
-from sqlalchemy.orm import Session
 from sqlalchemy import desc, or_
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import Session
 
-from app.database import get_db
+from app.database import get_db, recover_db_session
 from app.models import HRContact, Student
 from app.models.email_campaign import EmailCampaign
 from app.schemas.email_campaign import CampaignBulkPatchBody, CampaignUpdateBody
@@ -141,6 +142,10 @@ def list_campaigns(
         out = [_campaign_to_dict(c, hr, st) for c, hr, st in rows]
         logger.info("Campaigns fetched: %s", len(out))
         return out
+    except OperationalError as e:
+        recover_db_session(db, e, log=logger)
+        logger.warning("list_campaigns: database unavailable: %s", e)
+        raise HTTPException(status_code=503, detail="Database temporarily unavailable") from e
     except Exception:
         logger.exception("Error in list_campaigns")
         raise HTTPException(status_code=500, detail="Internal server error")

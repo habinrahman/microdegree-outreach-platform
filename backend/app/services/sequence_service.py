@@ -38,12 +38,59 @@ def reschedule_followups_from_initial_sent(
     initial_sent_at: datetime,
 ) -> None:
     """
-    Deprecated (v1 no-op).
+    Sequencer v1.1 correctness fix: anchor follow-up timing to the *actual* initial send time.
 
-    Historical behavior realigned FU ``scheduled_at`` to ``initial.sent_at + 7/14/21``.
-    Sequencer v1 uses **immutable** anchor dates only; send-time must not mutate the calendar.
+    Update only follow-up rows (seq 2..4), and only when they are still queueable:
+    ``status in (pending, scheduled)``.
+
+    - Never mutates sent/cancelled/replied/paused/processing/failed rows.
+    - Idempotent: safe to call repeatedly.
+    - Uses ``initial_sent_at`` (single source of truth) and writes naive UTC timestamps
+      (matches existing DB storage expectations for SQLite + Postgres).
     """
-    _ = (db, student_id, hr_id, initial_sent_at)
+    if initial_sent_at is None:
+        return
+    # Normalize: DB stores naive timestamps; treat as UTC.
+    base = _naive_utc(initial_sent_at)
+    if base is None:
+        return
+
+    # Only mutate follow-up rows that are still queueable.
+    queueable = ("pending", "scheduled")
+    rows = (
+        db.query(EmailCampaign)
+        .filter(
+            EmailCampaign.student_id == student_id,
+            EmailCampaign.hr_id == hr_id,
+            EmailCampaign.sequence_number.in_((2, 3, 4)),
+            EmailCampaign.status.in_(queueable),
+        )
+        .all()
+    )
+    if not rows:
+        return
+
+    desired_by_seq: dict[int, datetime] = {
+        2: base + timedelta(days=7),
+        3: base + timedelta(days=14),
+        4: base + timedelta(days=21),
+    }
+
+    changed = 0
+    for c in rows:
+        seq = int(getattr(c, "sequence_number", 0) or 0)
+        desired = desired_by_seq.get(seq)
+        if desired is None:
+            continue
+        cur = getattr(c, "scheduled_at", None)
+        # Only write when different (idempotency). Allow a 1s tolerance for old data.
+        if cur is None or abs((cur - desired).total_seconds()) >= 1.0:
+            c.scheduled_at = desired
+            db.add(c)
+            changed += 1
+
+    if changed:
+        db.commit()
 
 
 def _naive_utc(dt: datetime) -> datetime:

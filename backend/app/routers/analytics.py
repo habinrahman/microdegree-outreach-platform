@@ -5,10 +5,11 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, case, and_, or_, desc
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, aliased
 
 from app.auth import require_api_key
-from app.database import get_db
+from app.database import get_db, recover_db_session
 from app.models import Student, HRContact, Assignment, Response
 from app.models.email_campaign import EmailCampaign
 from app.utils.campaign_query_filters import email_campaigns_scoped_to_hr
@@ -50,6 +51,10 @@ def get_analytics_summary(include_demo: bool = False, db: Session = Depends(get_
         out = _analytics_summary_impl(include_demo, db)
         logger.info("Analytics summary OK")
         return out
+    except OperationalError as e:
+        recover_db_session(db, e, log=logger)
+        logger.warning("get_analytics_summary: database unavailable: %s", e)
+        raise HTTPException(status_code=503, detail="Database temporarily unavailable") from e
     except Exception:
         logger.exception("Error in get_analytics_summary")
         raise HTTPException(status_code=500, detail="Internal server error")
@@ -192,18 +197,49 @@ def _analytics_summary_impl(include_demo: bool, db: Session) -> dict:
         2,
     )
 
+    # Stage reply counts: same source of truth as the rest of this payload (email_campaigns),
+    # scoped identically to base_query. Do not use Response rows here — that caused pilot drift
+    # vs Campaigns/Replies views.
     replies_initial = (
         base_query.filter(
             func.lower(EmailCampaign.email_type) == "initial",
+            EmailCampaign.replied.is_(True),
             EmailCampaign.reply_text.isnot(None),
         )
         .with_entities(func.count(EmailCampaign.id))
         .scalar()
         or 0
     )
-    replies_fu1 = db.query(func.count(Response.id)).filter(Response.source_email_type == "followup_1").scalar() or 0
-    replies_fu2 = db.query(func.count(Response.id)).filter(Response.source_email_type == "followup_2").scalar() or 0
-    replies_fu3 = db.query(func.count(Response.id)).filter(Response.source_email_type == "followup_3").scalar() or 0
+    replies_fu1 = (
+        base_query.filter(
+            func.lower(EmailCampaign.email_type) == "followup_1",
+            EmailCampaign.replied.is_(True),
+            EmailCampaign.reply_text.isnot(None),
+        )
+        .with_entities(func.count(EmailCampaign.id))
+        .scalar()
+        or 0
+    )
+    replies_fu2 = (
+        base_query.filter(
+            func.lower(EmailCampaign.email_type) == "followup_2",
+            EmailCampaign.replied.is_(True),
+            EmailCampaign.reply_text.isnot(None),
+        )
+        .with_entities(func.count(EmailCampaign.id))
+        .scalar()
+        or 0
+    )
+    replies_fu3 = (
+        base_query.filter(
+            func.lower(EmailCampaign.email_type) == "followup_3",
+            EmailCampaign.replied.is_(True),
+            EmailCampaign.reply_text.isnot(None),
+        )
+        .with_entities(func.count(EmailCampaign.id))
+        .scalar()
+        or 0
+    )
 
     # Lifetime campaign-row counts: same HR/demo scope as base_query (DB source of truth for dashboard).
     _lt = (

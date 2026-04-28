@@ -1,6 +1,6 @@
 """Simple admin authentication (basic for now)."""
 import os
-from fastapi import Header, HTTPException
+from fastapi import Header, HTTPException, Request
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -25,10 +25,19 @@ ADMIN_API_KEY = _admin_key_configured() or ""
 
 
 def require_api_key(
+    request: Request,
     x_api_key: str | None = Header(None, alias="X-API-Key"),
     x_admin_key: str | None = Header(None, alias="X-Admin-Key"),
 ):
-    """Require X-API-Key or X-Admin-Key when ADMIN_API_KEY is set (non-empty)."""
+    """
+    Require X-API-Key / X-Admin-Key when ADMIN_API_KEY is set (non-empty).
+
+    Browser sessions may authenticate via SessionMiddleware (cookie-backed).
+    This keeps the existing operator key working for automation while enabling a
+    single-user login wall for the deployed dashboard.
+    """
+    if "session" in request.scope and bool(request.session.get("admin_logged_in") is True):
+        return True
     expected = _admin_key_configured()
     if not expected:
         return True

@@ -81,20 +81,66 @@ def test_reschedule_is_noop_preserves_scheduled_at(pair_db):
     db, st, hr, a = pair_db
     anchor = datetime(2026, 2, 1, 9, 0, 0, tzinfo=timezone.utc)
     ensure_four_step_campaign_rows(db, a, anchor=anchor)
-    fu2 = (
+    fu1 = (
         db.query(EmailCampaign)
         .filter(EmailCampaign.student_id == st.id, EmailCampaign.hr_id == hr.id, EmailCampaign.sequence_number == 2)
         .first()
     )
-    before = fu2.scheduled_at
+    before = fu1.scheduled_at
     reschedule_followups_from_initial_sent(
         db,
         student_id=st.id,
         hr_id=hr.id,
         initial_sent_at=datetime(2099, 1, 1, tzinfo=timezone.utc),
     )
+    db.refresh(fu1)
+    assert fu1.scheduled_at != before
+    assert (fu1.scheduled_at - _utc_naive(datetime(2099, 1, 1, tzinfo=timezone.utc))).days == 7
+
+
+def test_reschedule_idempotent_and_does_not_touch_sent_followups(pair_db):
+    db, st, hr, a = pair_db
+    anchor = datetime(2026, 2, 1, 9, 0, 0, tzinfo=timezone.utc)
+    ensure_four_step_campaign_rows(db, a, anchor=anchor)
+    initial_sent = datetime(2026, 3, 5, 10, 0, 0, tzinfo=timezone.utc)
+
+    # Mark FU2 as already sent; it must not be mutated by rescheduler.
+    fu2 = (
+        db.query(EmailCampaign)
+        .filter(EmailCampaign.student_id == st.id, EmailCampaign.hr_id == hr.id, EmailCampaign.sequence_number == 3)
+        .first()
+    )
+    fu2.status = "sent"
+    fu2.sent_at = _utc_naive(datetime(2026, 3, 1, tzinfo=timezone.utc))
+    old_fu2_sched = fu2.scheduled_at
+    db.add(fu2)
+    db.commit()
+
+    # First call sets queueable rows.
+    reschedule_followups_from_initial_sent(db, student_id=st.id, hr_id=hr.id, initial_sent_at=initial_sent)
+    fu1 = (
+        db.query(EmailCampaign)
+        .filter(EmailCampaign.student_id == st.id, EmailCampaign.hr_id == hr.id, EmailCampaign.sequence_number == 2)
+        .first()
+    )
+    fu3 = (
+        db.query(EmailCampaign)
+        .filter(EmailCampaign.student_id == st.id, EmailCampaign.hr_id == hr.id, EmailCampaign.sequence_number == 4)
+        .first()
+    )
     db.refresh(fu2)
-    assert fu2.scheduled_at == before
+    assert (fu1.scheduled_at - _utc_naive(initial_sent)).days == 7
+    assert (fu3.scheduled_at - _utc_naive(initial_sent)).days == 21
+    assert fu2.scheduled_at == old_fu2_sched  # sent row unchanged
+
+    # Second call is idempotent: no changes
+    before_fu1 = fu1.scheduled_at
+    before_fu3 = fu3.scheduled_at
+    reschedule_followups_from_initial_sent(db, student_id=st.id, hr_id=hr.id, initial_sent_at=initial_sent)
+    db.refresh(fu1)
+    db.refresh(fu3)
+    assert fu1.scheduled_at == before_fu1
+    assert fu3.scheduled_at == before_fu3
 
 
 def test_gate_blocks_followup_when_sequence_not_active(pair_db):

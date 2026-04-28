@@ -7,6 +7,8 @@ from smtplib import SMTPException, SMTPAuthenticationError
 logger = logging.getLogger(__name__)
 
 from app.database.config import SessionLocal
+from app.database.session_resilience import recover_db_session
+from sqlalchemy.exc import OperationalError
 from app.models import EmailCampaign, HRContact, Student
 from app.services.email_dispatcher import send_with_fallback
 from app.services.hr_validity import mark_hr_invalid_if_valid, outbound_failure_should_invalidate_hr
@@ -15,6 +17,9 @@ from app.utils.email_campaign_persist import persist_sent_email_campaign
 from app.services.campaign_lifecycle import assert_legal_email_campaign_transition
 from app.services.student_email_health import is_student_email_sending_blocked, refresh_student_email_health
 from app.services.deliverability_layer import evaluate_deliverability_for_send
+from app.services.runtime_settings_store import get_outbound_enabled
+from app.services.outbound_suppression_store import is_suppressed, upsert_suppression
+from app.services.pg_advisory_lock import campaign_send_lock
 from app.services.campaign_terminal_outcomes import (
     BOUNCED as TERMINAL_BOUNCED,
     NO_RESPONSE_COMPLETED,
@@ -76,6 +81,13 @@ def process_email_campaign(campaign_id: str) -> None:
     campaign = None
 
     try:
+        # Cross-process idempotency lock: prevents duplicate sends if multiple workers are invoked
+        # for the same campaign id (scheduler overlap, retries, manual + scheduler collision).
+        with campaign_send_lock(db, campaign_id) as acquired:
+            if not acquired:
+                logger.debug("SKIP: send lock held for %s", campaign_id)
+                return
+
         # Strict pre-guard:
         # - scheduled/pending: worker may claim itself
         # - processing: scheduler may have already claimed + committed the processing lock
@@ -131,6 +143,18 @@ def process_email_campaign(campaign_id: str) -> None:
 
         logger.debug("[SEND START] Campaign=%s", campaign.id)
 
+        # Global kill switch: release processing claim back to scheduled (do not cancel).
+        if not get_outbound_enabled(db):
+            logger.warning("Outbound disabled: blocking send campaign=%s", campaign.id)
+            assert_legal_email_campaign_transition(campaign.status, "scheduled", context="email_worker/outbound_disabled")
+            campaign.status = "scheduled"
+            campaign.error = "outbound_disabled"
+            campaign.processing_started_at = None
+            campaign.processing_lock_acquired_at = None
+            db.add(campaign)
+            db.commit()
+            return
+
         student = db.query(Student).filter(Student.id == campaign.student_id).first()
         if not student:
             raise RuntimeError("Missing student or HR record")
@@ -173,6 +197,20 @@ def process_email_campaign(campaign_id: str) -> None:
         _, parsed = parseaddr(hr_email)
         if not parsed or "@" not in parsed:
             raise ValueError(f"Invalid HR email: {hr_email}")
+
+        # Suppression list: hard block (recipient-specific).
+        blocked, sup_reason = is_suppressed(db, hr_email)
+        if blocked:
+            logger.warning("Suppression blocked send campaign=%s hr_email=%s reason=%s", campaign.id, hr_email, sup_reason)
+            assert_legal_email_campaign_transition(campaign.status, "cancelled", context="email_worker/suppressed")
+            campaign.status = "cancelled"
+            campaign.error = f"suppressed:{sup_reason or 'blocked'}"
+            campaign.suppression_reason = "suppression_list"
+            campaign.processing_started_at = None
+            campaign.processing_lock_acquired_at = None
+            db.add(campaign)
+            db.commit()
+            return
 
         # Safety check: if message_id already exists, this campaign has been sent before.
         if campaign.message_id:
@@ -288,6 +326,21 @@ def process_email_campaign(campaign_id: str) -> None:
 
         logger.debug("SAVED sent_at: %s %s", campaign.id, campaign.sent_at)
 
+        # Sequencer v1.1 correctness: follow-up calendar must be anchored to the actual initial send time.
+        # Keep the pre-created 4-row architecture; update only queueable follow-up rows.
+        if et_ok == "initial" and int(campaign.sequence_number or 0) == 1 and campaign.sent_at:
+            try:
+                from app.services.sequence_service import reschedule_followups_from_initial_sent
+
+                reschedule_followups_from_initial_sent(
+                    db,
+                    student_id=campaign.student_id,
+                    hr_id=campaign.hr_id,
+                    initial_sent_at=campaign.sent_at,
+                )
+            except Exception:
+                logger.warning("followup reschedule after initial send failed", exc_info=True)
+
         from app.services.log_stream import broadcast_log_sync
         broadcast_log_sync(
             {
@@ -313,6 +366,7 @@ def process_email_campaign(campaign_id: str) -> None:
         _safe_sync_sheets(db, "worker send success")
 
     except Exception as e:
+        recover_db_session(db, e if isinstance(e, OperationalError) else None, log=logger)
         cid = None
         try:
             cid = campaign.id if campaign is not None else None
@@ -330,6 +384,18 @@ def process_email_campaign(campaign_id: str) -> None:
                     bad_hr.is_valid = False
                     db.add(bad_hr)
                     db.commit()
+                # Suppress the raw email to prevent future sends even if HR is re-imported.
+                try:
+                    if bad_hr is not None and getattr(bad_hr, "email", None):
+                        upsert_suppression(
+                            db,
+                            email=str(bad_hr.email),
+                            reason="invalid_email",
+                            source="invalid_email",
+                            active=True,
+                        )
+                except Exception:
+                    pass
                 target = db.query(EmailCampaign).filter(EmailCampaign.id == campaign_id).first()
             if target is not None:
                 assert_legal_email_campaign_transition(target.status, "failed", context="email_worker/send-failure")
@@ -353,6 +419,19 @@ def process_email_campaign(campaign_id: str) -> None:
                         outcome=TERMINAL_BOUNCED,
                         tag_campaign=target,
                     )
+                    # Suppress recipient email on bounce to prevent repeated harm.
+                    try:
+                        hr_fail = db.query(HRContact).filter(HRContact.id == target.hr_id).first()
+                        if hr_fail is not None and getattr(hr_fail, "email", None):
+                            upsert_suppression(
+                                db,
+                                email=str(hr_fail.email),
+                                reason="bounce_detected",
+                                source="bounce",
+                                active=True,
+                            )
+                    except Exception:
+                        pass
                 target.sent_at = ensure_utc(datetime.now(timezone.utc))
                 hr_fail = db.query(HRContact).filter(HRContact.id == target.hr_id).first()
                 hr_email = getattr(hr_fail, "email", None) if hr_fail else None

@@ -11,6 +11,7 @@ from .hr_ignore import HRIgnored
 from .blocked_hr import BlockedHR
 from .student_template import StudentTemplate
 from .runtime_setting import RuntimeSetting
+from .outbound_suppression import OutboundSuppression
 
 __all__ = [
     "Student",
@@ -26,4 +27,5 @@ __all__ = [
     "BlockedHR",
     "StudentTemplate",
     "RuntimeSetting",
+    "OutboundSuppression",
 ]

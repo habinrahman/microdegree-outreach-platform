@@ -9,6 +9,7 @@ from app.auth import require_api_key
 from app.database import get_db
 from app.services.observability_metrics import prometheus_text
 from app.services.sre_reliability import build_reliability_payload
+from app.services.data_integrity_audit import build_data_integrity_snapshot
 
 router = APIRouter(
     prefix="/admin",
@@ -21,6 +22,16 @@ router = APIRouter(
 def admin_reliability(db: Session = Depends(get_db)):
     """Unified reliability, queues, SLO proxy, anomaly hints, and workflow trace docs."""
     return build_reliability_payload(db)
+
+
+@router.get("/data-integrity")
+def admin_data_integrity(include_demo: bool = False, db: Session = Depends(get_db)):
+    """
+    Cross-check a small set of aggregates operators compare across Dashboard, Campaigns, and Replies.
+
+    Read-only; intended for pilot go-live verification (requires the same auth as other /admin routes).
+    """
+    return build_data_integrity_snapshot(db, include_demo=include_demo)
 
 
 @router.get("/metrics/prometheus")

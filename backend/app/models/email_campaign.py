@@ -40,6 +40,8 @@ class EmailCampaign(Base):
     thread_id = Column(String(256), nullable=True)
     replied = Column(Boolean, default=False)
     replied_at = Column(DateTime, nullable=True)
+    # Inbound message time (IMAP INTERNALDATE / Date header); primary sort for Replies.
+    reply_received_at = Column(DateTime, nullable=True)
     reply_detected_at = Column(DateTime, nullable=True)
     # Canonical: INTERESTED | INTERVIEW | REJECTED | AUTO_REPLY | BOUNCE | OTHER
     reply_type = Column(String(64), nullable=True)

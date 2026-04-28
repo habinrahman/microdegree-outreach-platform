@@ -15,7 +15,7 @@ from typing import Any, Callable
 
 from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
-from sqlalchemy.exc import OperationalError, ProgrammingError
+from sqlalchemy.exc import OperationalError, PendingRollbackError, ProgrammingError
 
 from app.config import (
     SEND_START_HOUR,
@@ -36,6 +36,7 @@ from app.services.hr_health_scoring import (
     tier_at_or_above,
 )
 from app.database.config import SessionLocal
+from app.database.session_resilience import recover_db_session
 from app.models import EmailCampaign, HRContact, Campaign
 from app.models.student import Student
 from app.workers.email_worker import process_email_campaign
@@ -43,6 +44,8 @@ from app.utils.datetime_utils import ensure_utc
 from app.services.campaign_lifecycle import assert_legal_email_campaign_transition
 from app.services.deliverability_layer import scheduler_should_pause_sends
 from app.services.sequence_send_gate import scheduler_may_send_campaign
+from app.services.runtime_settings_store import get_outbound_enabled
+from app.services.outbound_suppression_store import is_suppressed
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +186,10 @@ def run_campaign_job(
         ):
             return {"sent": 0, "failed": 0, "skipped": 0, "errors": [], "note": "outside_ist_send_window"}
 
+        # Global outbound kill switch (DB-backed).
+        if not get_outbound_enabled(db):
+            return {"sent": 0, "failed": 0, "skipped": 0, "errors": [], "note": "outbound_disabled"}
+
         logger.debug("Sending due campaigns")
 
         # Self-heal: recover campaigns stuck in processing (crash mid-flight).
@@ -253,6 +260,8 @@ def run_campaign_job(
                 logger.info("Marked %s scheduled campaign(s) overdue_late (cutoff lag_minutes=%s)", len(overdue_rows), lag_m)
         except Exception as e:
             logger.debug("overdue_late marking skipped: %s", e)
+            # Must clear aborted transaction or the next statement raises PendingRollbackError.
+            recover_db_session(db, e if isinstance(e, OperationalError) else None, log=logger)
 
         # Backward compat: older code can leave rows as pending.
         # Normalize pending -> scheduled (immediately due) so the scheduler uses a single deterministic fetch path.
@@ -342,6 +351,24 @@ def run_campaign_job(
         }
         due = [c for c in due if c.student_id not in cooldown_student_ids]
 
+        # Suppression list (recipient blocks). Keep this lightweight; worker re-checks for defense-in-depth.
+        filtered: list[EmailCampaign] = []
+        for c in due:
+            try:
+                hr_email = (getattr(getattr(c, "hr_contact", None), "email", None) or "").strip()
+                # fallback if relationship not loaded
+                if not hr_email:
+                    hr_row = db.query(HRContact.email).filter(HRContact.id == c.hr_id).first()
+                    hr_email = (hr_row[0] if hr_row else "") or ""
+                blocked, _reason = is_suppressed(db, hr_email, now_utc=now_utc)
+                if blocked:
+                    continue
+            except Exception:
+                # suppression check errs on safety in the worker; scheduler keeps throughput.
+                pass
+            filtered.append(c)
+        due = filtered
+
         gated: list[EmailCampaign] = []
         for c in due:
             ok, reason = scheduler_may_send_campaign(
@@ -380,8 +407,34 @@ def run_campaign_job(
         skipped = 0
         errors: list[dict] = []
 
-        for campaign in to_send:
-            if time.time() - start_time > 50:
+        deadline_s = 50.0
+        for i, campaign in enumerate(to_send):
+            if time.time() - start_time > deadline_s:
+                # IMPORTANT: do not leave unprocessed rows stuck in "processing" just because
+                # this tick hit the runtime budget. Only rows actually handed to the worker
+                # should remain processing/sent/failed. Revert the remainder back to scheduled.
+                try:
+                    remainder = to_send[i:]
+                    if remainder:
+                        for r in remainder:
+                            if getattr(r, "status", None) == "processing":
+                                assert_legal_email_campaign_transition(
+                                    r.status,
+                                    "scheduled",
+                                    context="campaign_scheduler/runtime-budget-revert-unprocessed",
+                                )
+                                r.status = "scheduled"
+                                r.processing_started_at = None
+                                r.processing_lock_acquired_at = None
+                                # Preserve any existing error for operator visibility; do not overwrite.
+                                db.add(r)
+                        db.commit()
+                except Exception as e:
+                    logger.warning("runtime budget revert failed: %s", e)
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
                 break
             # Campaigns in to_send are already locked (status=processing) + committed.
             if campaign.status != "processing":
@@ -458,6 +511,8 @@ def run_campaign_job(
                     time.sleep(random.uniform(1.0, 4.5))
             except Exception as e:
                 logger.error("Internal server error", exc_info=e)
+                if isinstance(e, OperationalError):
+                    recover_db_session(db, e, log=logger)
                 assert_legal_email_campaign_transition(
                     campaign.status, "failed", context="campaign_scheduler/process_email_exception"
                 )
@@ -490,16 +545,26 @@ def run_campaign_job(
             "run_campaign_job: database unavailable (will retry next tick): %s", e
         )
         if db is not None:
-            try:
-                db.rollback()
-            except Exception:
-                pass
+            recover_db_session(db, e, log=logger)
         return {
             "sent": 0,
             "failed": 0,
             "skipped": 0,
             "errors": [],
             "note": "db_unavailable",
+        }
+    except PendingRollbackError as e:
+        logger.warning(
+            "run_campaign_job: stale session after DB error (will retry next tick): %s", e
+        )
+        if db is not None:
+            recover_db_session(db, None, log=logger)
+        return {
+            "sent": 0,
+            "failed": 0,
+            "skipped": 0,
+            "errors": [],
+            "note": "session_reset",
         }
     finally:
         if db is not None:
@@ -548,6 +613,7 @@ def start_scheduler():
         try:
             sync_new_replies(db)
         except Exception as e:
+            recover_db_session(db, e if isinstance(e, OperationalError) else None, log=logger)
             logger.warning("sheet_sync job failed: %s", e)
         finally:
             db.close()
@@ -560,6 +626,7 @@ def start_scheduler():
         try:
             refresh_all_students_email_health(db)
         except Exception as e:
+            recover_db_session(db, e if isinstance(e, OperationalError) else None, log=logger)
             logger.warning("student email health job failed: %s", e)
         finally:
             db.close()
