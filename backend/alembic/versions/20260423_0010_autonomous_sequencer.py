@@ -18,14 +18,16 @@ def upgrade() -> None:
     bind = op.get_bind()
     dialect = getattr(bind.dialect, "name", "") if bind else ""
 
-    op.create_table(
-        "runtime_settings",
-        sa.Column("id", sa.String(36), primary_key=True, nullable=False),
-        sa.Column("key", sa.String(128), nullable=False),
-        sa.Column("value", sa.Text(), nullable=False),
-        sa.Column("updated_at", sa.DateTime(), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
-        sa.UniqueConstraint("key", name="uq_runtime_settings_key"),
-    )
+    insp = sa.inspect(bind)
+    if not insp.has_table("runtime_settings"):
+        op.create_table(
+            "runtime_settings",
+            sa.Column("id", sa.String(36), primary_key=True, nullable=False),
+            sa.Column("key", sa.String(128), nullable=False),
+            sa.Column("value", sa.Text(), nullable=False),
+            sa.Column("updated_at", sa.DateTime(), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
+            sa.UniqueConstraint("key", name="uq_runtime_settings_key"),
+        )
 
     if dialect == "postgresql":
         op.execute(
@@ -43,7 +45,9 @@ def upgrade() -> None:
 def downgrade() -> None:
     bind = op.get_bind()
     dialect = getattr(bind.dialect, "name", "") if bind else ""
-    op.drop_table("runtime_settings")
+    insp = sa.inspect(bind)
+    if insp.has_table("runtime_settings"):
+        op.drop_table("runtime_settings")
     if dialect == "postgresql":
         op.execute("ALTER TABLE email_campaigns DROP COLUMN IF EXISTS suppression_reason;")
     else:

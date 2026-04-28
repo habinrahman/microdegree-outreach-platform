@@ -27,6 +27,7 @@ from app.routers import students, hr, assignments, outreach, responses, campaign
 from app.routers import hrs_legacy, analytics, notifications, interviews
 from app.routers import campaign_manager, replies, outreach as outreach_router
 from app.routers import campaigns_admin
+from app.routers import outbound_admin
 from app.routers import audit
 from app.routers import backups_admin
 from app.routers import reliability_admin
@@ -44,6 +45,7 @@ from app.services.outreach_service import send_one
 from app.services.log_stream import websocket_logs as logs_ws, set_main_loop
 from app.services.deprecation_guard import assert_no_deprecated_legacy_log_usage
 from app.auth import _admin_key_configured, is_production_runtime, require_api_key
+from app.routers import auth_session
 
 logger = logging.getLogger(__name__)
 
@@ -57,8 +59,10 @@ def _enforce_production_secrets() -> None:
         missing.append("DATABASE_URL")
     if not (os.getenv("SESSION_SECRET_KEY") or "").strip():
         missing.append("SESSION_SECRET_KEY")
-    if not (os.getenv("ADMIN_API_KEY") or "").strip():
-        missing.append("ADMIN_API_KEY")
+    if not (os.getenv("ADMIN_API_KEY") or "").strip() and (
+        not (os.getenv("ADMIN_USERNAME") or "").strip() or not (os.getenv("ADMIN_PASSWORD_HASH") or "").strip()
+    ):
+        missing.append("ADMIN_API_KEY (or ADMIN_USERNAME + ADMIN_PASSWORD_HASH)")
     if missing:
         raise RuntimeError(
             "Production requires non-empty environment variables (no dev fallbacks): "
@@ -196,10 +200,53 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def _is_session_authed(request: Request) -> bool:
+    # Starlette's Request.session property asserts if SessionMiddleware hasn't executed yet.
+    if "session" not in request.scope:
+        return False
+    return bool(request.session.get("admin_logged_in") is True)
+
+
+def _is_header_key_authed(request: Request) -> bool:
+    expected = _admin_key_configured()
+    if not expected:
+        return False
+    sent = (request.headers.get("x-api-key") or request.headers.get("x-admin-key") or "").strip()
+    return sent == expected
+
+
+_AUTH_ALLOWLIST_PREFIXES = (
+    "/auth/",
+    "/health",
+    "/scheduler/status",
+)
+
+
+@app.middleware("http")
+async def auth_wall(request: Request, call_next):
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    p = request.url.path or "/"
+    if any(p.startswith(pref) for pref in _AUTH_ALLOWLIST_PREFIXES):
+        return await call_next(request)
+    if _is_session_authed(request) or _is_header_key_authed(request):
+        return await call_next(request)
+    return JSONResponse(status_code=401, content={"detail": "Not authenticated"})
+
+
 # OAuth /auth/* routes use request.session (gmail_oauth.auth_router).
 # Production: SESSION_SECRET_KEY is enforced by _enforce_production_secrets() above.
+#
+# IMPORTANT: SessionMiddleware must run BEFORE auth_wall so request.session is available.
 _session_secret = (os.getenv("SESSION_SECRET_KEY") or "").strip() or "dev-only-insecure-session-key-minimum-32-chars!!"
-app.add_middleware(SessionMiddleware, secret_key=_session_secret, same_site="lax")
+_is_prod = is_production_runtime()
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=_session_secret,
+    same_site="lax",
+    https_only=_is_prod,
+    max_age=60 * 60 * 24 * 30,
+)
 
 
 @app.exception_handler(OperationalError)
@@ -242,10 +289,12 @@ app.include_router(audit.router)
 app.include_router(backups_admin.router)
 app.include_router(reliability_admin.router)
 app.include_router(campaigns_admin.router)
+app.include_router(outbound_admin.router)
 app.include_router(health.router)
 if os.getenv("DEBUG", "").strip().lower() in ("1", "true", "yes"):
     app.include_router(debug_router.router)
 app.include_router(hr_contacts_compat.router)
+app.include_router(auth_session.router)
 app.include_router(gmail_oauth.router)
 app.include_router(gmail_oauth.auth_router)
 app.include_router(blocked_hr.router)

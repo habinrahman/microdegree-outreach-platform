@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 KEY_FOLLOWUPS_DISPATCH = "followups_dispatch_enabled"
+KEY_OUTBOUND_ENABLED = "outbound_enabled"
 
 
 def ensure_runtime_settings_schema_connection(connection: Connection) -> None:
@@ -67,19 +68,23 @@ def ensure_runtime_settings_schema_connection(connection: Connection) -> None:
         logger.warning("runtime_settings bootstrap: unsupported dialect %r", dialect)
         return
 
-    row = connection.execute(
-        text("SELECT 1 FROM runtime_settings WHERE key = :k LIMIT 1"),
-        {"k": KEY_FOLLOWUPS_DISPATCH},
-    ).first()
-    if row is None:
-        connection.execute(
-            text(
-                "INSERT INTO runtime_settings (id, key, value, updated_at) "
-                "VALUES (:id, :k, :v, CURRENT_TIMESTAMP)"
-            ),
-            {"id": str(uuid.uuid4()), "k": KEY_FOLLOWUPS_DISPATCH, "v": "true"},
-        )
-        logger.info("runtime_settings bootstrap: seeded %s=true", KEY_FOLLOWUPS_DISPATCH)
+    def _seed_if_missing(key: str, value: str) -> None:
+        row = connection.execute(
+            text("SELECT 1 FROM runtime_settings WHERE key = :k LIMIT 1"),
+            {"k": key},
+        ).first()
+        if row is None:
+            connection.execute(
+                text(
+                    "INSERT INTO runtime_settings (id, key, value, updated_at) "
+                    "VALUES (:id, :k, :v, CURRENT_TIMESTAMP)"
+                ),
+                {"id": str(uuid.uuid4()), "k": key, "v": value},
+            )
+            logger.info("runtime_settings bootstrap: seeded %s=%s", key, value)
+
+    _seed_if_missing(KEY_FOLLOWUPS_DISPATCH, "true")
+    _seed_if_missing(KEY_OUTBOUND_ENABLED, "true")
 
 
 def ensure_runtime_settings_schema_for_engine(engine: Engine) -> None:

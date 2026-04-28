@@ -15,7 +15,9 @@ class Student(Base):
     skills = Column(Text, nullable=True)
     resume_drive_file_id = Column(String(512), nullable=True)
     resume_file_name = Column(String(255), nullable=True)
-    resume_path = Column(String(512), nullable=True)  # local file path for email attachment
+    resume_path = Column(String(512), nullable=True)  # local file path for email attachment (active for outreach)
+    resume_updated_at = Column(DateTime, nullable=True)
+    resume_archive_path = Column(Text, nullable=True)  # previous file path kept on disk (soft replace)
     app_password = Column(String(255), nullable=True)  # Gmail app password for SMTP
     domain = Column(String(100), nullable=True)  # legacy field used by existing dashboard
     linkedin_url = Column(String(512), nullable=True)

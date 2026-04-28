@@ -50,7 +50,7 @@ def run_migrations_offline() -> None:
 def run_migrations_online() -> None:
     url = _migration_url()
     configuration = config.get_section(config.config_ini_section) or {}
-    configuration["sqlalchemy.url"] = url.replace("%", "%%")
+    configuration["sqlalchemy.url"] = url
 
     connectable = engine_from_config(
         configuration,
@@ -59,6 +59,15 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
+        # Managed Postgres providers sometimes enforce aggressive default timeouts that
+        # can cancel Alembic reflection queries and DDL. For migrations, we prefer
+        # correctness/completion over latency.
+        try:
+            connection.exec_driver_sql("SET statement_timeout TO 0")
+            connection.exec_driver_sql("SET lock_timeout TO 0")
+        except Exception:
+            # Best-effort: if the server disallows changing these, proceed.
+            pass
         context.configure(
             connection=connection,
             target_metadata=target_metadata,

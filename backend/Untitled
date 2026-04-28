@@ -1,1 +1,1 @@
-reset_export.py
+python -c "import getpass,bcrypt; p=getpass.getpass('Password: '); print('ADMIN_PASSWORD_HASH='+bcrypt.hashpw(p.encode(), bcrypt.gensalt(12)).decode())"

@@ -23,6 +23,8 @@ class StudentPublic(BaseModel):
     resume_drive_file_id: Optional[str] = None
     resume_file_name: Optional[str] = None
     resume_path: Optional[str] = None
+    resume_updated_at: Optional[datetime] = None
+    active_resume_url: Optional[str] = None
     linkedin_url: Optional[str] = None
     created_at: datetime
     emails_sent_today: int = 0
