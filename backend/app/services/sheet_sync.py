@@ -6,18 +6,22 @@ import logging
 import random
 import threading
 import time
-from typing import Any
+from typing import Any, Literal
 from datetime import datetime, timezone
 import zlib
 
 from sqlalchemy import and_, func, or_
-from sqlalchemy.orm import Session
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import Session
+
+from app.database.session_resilience import recover_db_session
 
 from app.models import EmailCampaign, Student, HRContact
 import gspread
 
 from app.services.google_sheets import get_sheet, get_worksheet, open_spreadsheet
+from app.services.export_normalization import normalize_export_cell, normalize_export_row
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +34,15 @@ _last_advisory_lock_skip_at_utc: str | None = None
 _last_pending_total_observed: int | None = None
 _last_pending_increase_at_utc: str | None = None
 
+# Stable sheet drift (extra rows vs DB) — log at most once per interval to avoid noisy 2‑min polls.
+_last_mirror_drift_log_at_utc: float | None = None
+_MIRROR_DRIFT_LOG_INTERVAL_SEC = 3600.0
+
 # Step 1 follow-ups foundation: placeholder worksheet name (not used yet; no behavior change).
 FOLLOWUPS_SHEET_TAB_NAME = "Follow-ups"
 
-# Row 1 headers — must match append_rows column order in _sync_new_replies_impl (do not shorten).
+# Row 1 headers — must match append_rows column order in _sync_new_replies_impl.
+# Keep exports LEAN and spreadsheet-safe (no giant raw reply bodies).
 _HEADER_REPLIES = [
     "student_name",
     "company",
@@ -43,15 +52,13 @@ _HEADER_REPLIES = [
     "status",
     "email_type",
     "reply_status",
-    "reply_preview",
+    "reply_preview_truncated",
     "reply_detected_at",
-    "sequence_number",
-    "outbound_message_id",
+    "thread_id",
     "sent_at",
-    "reply_from_header",
-    "suppression_reason",
-    "terminal_outcome",
-    "audit_notes",
+    "sender",
+    "reply_classification",
+    "campaign_state",
 ]
 _HEADER_FAILURES = [
     "student_name",
@@ -77,6 +84,7 @@ _HEADER_BOUNCES = [
     "reply_status",
     "delivery_status",
     "reply_preview",
+    "reply_preview_truncated",
     "sent_at",
     "email_type",
     "sequence_number",
@@ -366,7 +374,7 @@ def _audit_notes(c: EmailCampaign) -> str:
         f"delivery={c.delivery_status or ''}",
         f"failure_type={c.failure_type or ''}",
     ]
-    err = (c.error or "").replace("\n", " ")[:400]
+    err = normalize_export_cell(c.error or "", max_len=400)
     if err:
         parts.append(f"error={err}")
     return " | ".join(parts)[:1500]
@@ -395,6 +403,28 @@ def _ensure_header(ws, header: list[str]) -> None:
         first = []
     if not first or not any(str(x).strip() for x in first):
         ws.insert_row(header, 1)
+        return
+    # If header row exists but doesn't match canonical (missing/new cols), overwrite row 1 only.
+    # This preserves data rows while keeping exports structurally stable.
+    cur = [str(x).strip() for x in first]
+    canon = [str(x).strip() for x in header]
+    if cur != canon:
+        try:
+            ws.update("A1", [header])
+        except Exception:
+            # Best-effort; appends will still be rectangular even if header lags.
+            pass
+
+
+def _reply_preview_truncated(c: EmailCampaign) -> str:
+    """Operator-safe preview only (single-line, capped). Never export full raw bodies."""
+    raw = c.reply_text or c.reply_snippet or ""
+    return normalize_export_cell(raw, max_len=300)
+
+
+def _export_thread_id(c: EmailCampaign) -> str:
+    # Prefer strict thread_id; fall back to gmail thread id and then message id for legacy rows.
+    return normalize_export_cell(getattr(c, "thread_id", None) or getattr(c, "gmail_thread_id", None) or getattr(c, "message_id", None) or "")
 
 
 def _has_inbound_reply_body():
@@ -435,6 +465,43 @@ def _reply_eligibility_predicate():
 
 def _bounce_eligibility_predicate():
     return EmailCampaign.reply_status.in_(("BOUNCED", "BLOCKED", "BOUNCE"))
+
+
+def _classify_mirror_tab(
+    tab: dict[str, Any], *, eligible_key: str, exported_key: str
+) -> Literal["ok", "drift", "critical"]:
+    """
+    ``drift`` = DB export flags match eligible counts but the sheet has *extra* data rows
+    (historical/manual rows). ``critical`` = missing sheet rows or export flags not caught up.
+    """
+    if tab.get("ok"):
+        return "ok"
+    elig = int(tab[eligible_key])
+    exp = int(tab[exported_key])
+    sh = int(tab["sheet_rows"])
+    if exp != elig:
+        return "critical"
+    if sh < elig:
+        return "critical"
+    if sh > elig:
+        return "drift"
+    return "critical"
+
+
+def _mirror_validation_severity(validation: dict[str, Any]) -> Literal["ok", "drift", "critical"]:
+    worst: Literal["ok", "drift", "critical"] = "ok"
+    order = {"ok": 0, "drift": 1, "critical": 2}
+    for tab, ek, xk in (
+        (validation["replies"], "db_eligible", "db_exported_flag"),
+        (validation["failures"], "db_failed_rows", "db_exported_flag"),
+        (validation["bounces"], "db_eligible", "db_exported_flag"),
+    ):
+        s = _classify_mirror_tab(tab, eligible_key=ek, exported_key=xk)
+        if order[s] > order[worst]:
+            worst = s
+        if worst == "critical":
+            break
+    return worst
 
 
 def _validate_mirror_counts(
@@ -499,6 +566,7 @@ def _validate_mirror_counts(
     out["all_ok"] = (
         out["replies"]["ok"] and out["failures"]["ok"] and out["bounces"]["ok"]
     )
+    out["severity"] = _mirror_validation_severity(out)
     return out
 
 
@@ -540,12 +608,12 @@ def sync_new_replies(db: Session) -> dict[str, Any] | None:
     Thread-safe export. Returns validation dict from _validate_mirror_counts, or None on hard failure
     before validation.
     """
+    global _advisory_lock_skip_count, _last_advisory_lock_skip_at_utc, _last_success_at_utc, _last_mirror_drift_log_at_utc
     with _sheet_sync_lock:
         got_lock = False
         try:
             got_lock = _try_pg_advisory_lock(db)
             if not got_lock:
-                global _advisory_lock_skip_count, _last_advisory_lock_skip_at_utc
                 _advisory_lock_skip_count = int(_advisory_lock_skip_count) + 1
                 _last_advisory_lock_skip_at_utc = datetime.now(timezone.utc).isoformat()
                 logger.info("sheet_sync: skip run (another instance holds advisory lock)")
@@ -557,27 +625,50 @@ def sync_new_replies(db: Session) -> dict[str, Any] | None:
             bounces_ws = get_sheet("Bounces")
             validation = _validate_mirror_counts(db, replies_ws, failures_ws, bounces_ws)
             if validation["all_ok"]:
-                global _last_success_at_utc
                 _last_success_at_utc = datetime.now(timezone.utc).isoformat()
+                _last_mirror_drift_log_at_utc = None
                 logger.info(
                     "sheet_sync: mirror validation OK — Replies %s, Failures %s, Bounces %s",
                     validation["replies"]["sheet_rows"],
                     validation["failures"]["sheet_rows"],
                     validation["bounces"]["sheet_rows"],
                 )
+            elif validation.get("severity") == "drift":
+                now_m = time.monotonic()
+                if (
+                    _last_mirror_drift_log_at_utc is None
+                    or (now_m - _last_mirror_drift_log_at_utc) >= _MIRROR_DRIFT_LOG_INTERVAL_SEC
+                ):
+                    _last_mirror_drift_log_at_utc = now_m
+                    logger.warning(
+                        "sheet_sync: mirror sheet drift (DB export flags complete; extra rows on "
+                        "sheet — trim orphans or run rebuild_sheet_full; this warning at most once/hour "
+                        "while drift persists) — detail=%s",
+                        validation,
+                    )
             else:
                 logger.error(
                     "sheet_sync: mirror validation MISMATCH — detail=%s",
                     validation,
                 )
             return validation
+        except OperationalError as e:
+            recover_db_session(db, e, log=logger)
+            logger.warning(
+                "sheet_sync: database unavailable (session recovered; will retry next tick): %s",
+                e,
+            )
+            return None
         except Exception:
-            db.rollback()
+            recover_db_session(db, None, log=logger)
             logger.exception("sheet_sync: run failed (session rolled back)")
             return None
         finally:
             if got_lock:
-                _release_pg_advisory_lock(db)
+                try:
+                    _release_pg_advisory_lock(db)
+                except Exception:
+                    recover_db_session(db, None, log=logger)
 
 
 def _sync_new_replies_impl(db: Session) -> None:
@@ -643,32 +734,39 @@ def _sync_new_replies_impl(db: Session) -> None:
     )
 
     pending_reply: list[tuple[EmailCampaign, list]] = []
+    seen_reply_ids: set[str] = set()
     for c in reply_rows:
         if c.exported_to_sheet:
             continue
+        cid = str(c.id)
+        if cid in seen_reply_ids:
+            continue
+        seen_reply_ids.add(cid)
         student_name, company, hr_email = _student_hr_row(db, c)
+        prev_trunc = _reply_preview_truncated(c)
         pending_reply.append(
             (
                 c,
-                [
-                    student_name,
-                    company,
-                    hr_email,
-                    str(c.id),
-                    (c.subject or "")[:500],
-                    c.status or "",
-                    c.email_type or "",
-                    c.reply_status or "",
-                    (c.reply_text or c.reply_snippet or "").replace("\n", " ")[:500],
-                    str(c.reply_detected_at or c.replied_at or ""),
-                    str(c.sequence_number or ""),
-                    str(c.message_id or ""),
-                    str(c.sent_at or ""),
-                    (c.reply_from or "")[:500],
-                    (c.suppression_reason or "")[:500],
-                    (c.terminal_outcome or "")[:64],
-                    _audit_notes(c),
-                ],
+                normalize_export_row(
+                    [
+                        student_name,
+                        company,
+                        hr_email,
+                        cid,
+                        normalize_export_cell(c.subject or "", max_len=500),
+                        c.status or "",
+                        c.email_type or "",
+                        c.reply_status or "",
+                        prev_trunc,
+                        c.reply_detected_at or c.replied_at or "",
+                        _export_thread_id(c),
+                        c.sent_at or "",
+                        normalize_export_cell(c.reply_from or "", max_len=500),
+                        normalize_export_cell(getattr(c, "reply_type", None) or (c.reply_status or ""), max_len=64),
+                        normalize_export_cell(getattr(c, "sequence_state", None) or "", max_len=64),
+                    ],
+                    expected_len=len(_HEADER_REPLIES),
+                ),
             )
         )
 
@@ -709,28 +807,36 @@ def _sync_new_replies_impl(db: Session) -> None:
     )
 
     pending_fail: list[tuple[EmailCampaign, list]] = []
+    seen_fail_ids: set[str] = set()
     for c in failed_campaigns:
         if c.exported_failure_sheet:
             continue
+        cid = str(c.id)
+        if cid in seen_fail_ids:
+            continue
+        seen_fail_ids.add(cid)
         student_name, company, hr_email = _student_hr_row(db, c)
         pending_fail.append(
             (
                 c,
-                [
-                    student_name,
-                    company,
-                    hr_email,
-                    str(c.id),
-                    (c.subject or "")[:500],
-                    c.status or "",
-                    (c.error or "")[:1000],
-                    str(c.sent_at or ""),
-                    c.email_type or "",
-                    str(c.sequence_number or ""),
-                    (c.suppression_reason or "")[:500],
-                    (c.terminal_outcome or "")[:64],
-                    _audit_notes(c),
-                ],
+                normalize_export_row(
+                    [
+                        student_name,
+                        company,
+                        hr_email,
+                        cid,
+                        normalize_export_cell(c.subject or "", max_len=500),
+                        c.status or "",
+                        normalize_export_cell(c.error or "", max_len=1000),
+                        c.sent_at or "",
+                        c.email_type or "",
+                        c.sequence_number or "",
+                        normalize_export_cell(c.suppression_reason or "", max_len=500),
+                        normalize_export_cell(c.terminal_outcome or "", max_len=64),
+                        _audit_notes(c),
+                    ],
+                    expected_len=len(_HEADER_FAILURES),
+                ),
             )
         )
 
@@ -769,29 +875,41 @@ def _sync_new_replies_impl(db: Session) -> None:
     )
 
     pending_bounce: list[tuple[EmailCampaign, list]] = []
+    seen_bounce_ids: set[str] = set()
     for c in bounce_rows:
         if c.exported_bounce_sheet:
             continue
+        cid = str(c.id)
+        if cid in seen_bounce_ids:
+            continue
+        seen_bounce_ids.add(cid)
         student_name, company, hr_email = _student_hr_row(db, c)
+        # Bounces tab keeps legacy schema, but must still be single-line / safe.
+        prev_full = normalize_export_cell(c.reply_text or c.reply_snippet or "", max_len=2000)
+        prev_trunc = normalize_export_cell(c.reply_text or c.reply_snippet or "", max_len=300)
         pending_bounce.append(
             (
                 c,
-                [
-                    student_name,
-                    company,
-                    hr_email,
-                    str(c.id),
-                    (c.subject or "")[:500],
-                    c.reply_status or "",
-                    c.delivery_status or "",
-                    (c.reply_text or c.reply_snippet or "").replace("\n", " ")[:500],
-                    str(c.sent_at or c.replied_at or ""),
-                    c.email_type or "",
-                    str(c.sequence_number or ""),
-                    (c.suppression_reason or "")[:500],
-                    (c.terminal_outcome or "")[:64],
-                    _audit_notes(c),
-                ],
+                normalize_export_row(
+                    [
+                        student_name,
+                        company,
+                        hr_email,
+                        cid,
+                        normalize_export_cell(c.subject or "", max_len=500),
+                        c.reply_status or "",
+                        c.delivery_status or "",
+                        prev_full,
+                        prev_trunc,
+                        c.sent_at or c.replied_at or "",
+                        c.email_type or "",
+                        c.sequence_number or "",
+                        normalize_export_cell(c.suppression_reason or "", max_len=500),
+                        normalize_export_cell(c.terminal_outcome or "", max_len=64),
+                        _audit_notes(c),
+                    ],
+                    expected_len=len(_HEADER_BOUNCES),
+                ),
             )
         )
 
@@ -863,9 +981,156 @@ def rebuild_sheet_full(db: Session, *, include_demo: bool = False) -> dict[str, 
         validation = _validate_mirror_counts(db, replies_ws, failures_ws, bounces_ws)
         if validation["all_ok"]:
             logger.info("sheet_sync rebuild_sheet_full: mirror validation OK — %s", validation)
+        elif validation.get("severity") == "drift":
+            logger.warning(
+                "sheet_sync rebuild_sheet_full: mirror sheet drift — %s",
+                validation,
+            )
         else:
             logger.error("sheet_sync rebuild_sheet_full: mirror validation MISMATCH — %s", validation)
         return validation
+
+
+def rebuild_replies_sheet(db: Session, *, include_demo: bool = False, force: bool = False) -> dict[str, Any]:
+    """
+    One-time sheet repair/migration:
+    - Inspect current Replies header/shape.
+    - If header differs from canonical OR row width exceeds canonical (corrupted tab),
+      archive the entire tab as ``Replies_Legacy_Backup_<timestamp>``.
+    - Recreate a fresh ``Replies`` tab with canonical headers only.
+    - Backfill from DB using normalized rows only (full rebuild, not append).
+
+    This is intentionally Replies-only (does not touch Failures/Bounces tabs).
+    """
+    _ = include_demo
+    with _sheet_sync_lock:
+        ss = open_spreadsheet()
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        backup_title = f"Replies_Legacy_Backup_{ts}"
+
+        try:
+            replies_ws = ss.worksheet("Replies")
+        except gspread.WorksheetNotFound:
+            replies_ws = get_worksheet("Replies", rows=3000, cols=max(20, len(_HEADER_REPLIES)))
+
+        # Inspect shape (may contain ragged / corrupted rows).
+        try:
+            raw = replies_ws.get_all_values()
+        except Exception:
+            raw = []
+
+        canonical = [str(x).strip() for x in _HEADER_REPLIES]
+        cur_header = [str(x).strip() for x in (raw[0] if raw else [])]
+        max_width = max((len(r) for r in raw), default=len(cur_header))
+
+        header_mismatch = cur_header != canonical
+        width_exceeds = int(max_width) > int(len(canonical))
+        should_repair = force or header_mismatch or width_exceeds
+
+        if should_repair and raw:
+            logger.warning(
+                "sheet_sync rebuild_replies_sheet: archiving legacy Replies tab (header_mismatch=%s width_exceeds=%s rows=%s max_width=%s)",
+                header_mismatch,
+                width_exceeds,
+                len(raw),
+                max_width,
+            )
+            # Create a backup worksheet and copy values (best-effort).
+            try:
+                backup_ws = ss.add_worksheet(
+                    title=backup_title,
+                    rows=max(10, len(raw) + 10),
+                    cols=max(10, max_width + 2),
+                )
+                # Write rows in chunks so huge tabs don't exceed request limits.
+                chunk = 200
+                for start in range(0, len(raw), chunk):
+                    backup_ws.append_rows(raw[start : start + chunk], value_input_option="RAW")
+            except Exception:
+                logger.exception("sheet_sync rebuild_replies_sheet: backup copy failed (continuing with rebuild)")
+
+        # Always rebuild the Replies tab cleanly if repair triggered, otherwise no-op.
+        if not should_repair:
+            return {
+                "ok": True,
+                "action": "noop",
+                "reason": "Replies tab already canonical",
+                "header_match": True,
+                "max_width": int(max_width),
+                "canonical_width": int(len(canonical)),
+            }
+
+        # Recreate fresh Replies tab:
+        # - delete+recreate is safest because corrupted grid size / formats can persist.
+        try:
+            ss.del_worksheet(replies_ws)
+        except Exception:
+            # Fallback: clear content.
+            try:
+                replies_ws.clear()
+            except Exception:
+                pass
+
+        replies_ws = get_worksheet("Replies", rows=3000, cols=max(20, len(_HEADER_REPLIES)))
+        clear_worksheet(replies_ws, _HEADER_REPLIES)
+
+        # Full backfill from DB: reset export flags for replies only.
+        rep_pred = _reply_eligibility_predicate()
+        db.query(EmailCampaign).filter(rep_pred).update({"exported_to_sheet": False}, synchronize_session=False)
+        db.commit()
+
+        # Reuse the same normalized row emission as sync (but no reconcile/dedupe-on-sheet needed).
+        reply_rows = (
+            db.query(EmailCampaign)
+            .filter(rep_pred, EmailCampaign.exported_to_sheet.is_(False))
+            .all()
+        )
+        pending: list[tuple[EmailCampaign, list[str]]] = []
+        seen: set[str] = set()
+        for c in reply_rows:
+            cid = str(c.id)
+            if cid in seen:
+                continue
+            seen.add(cid)
+            student_name, company, hr_email = _student_hr_row(db, c)
+            row = normalize_export_row(
+                [
+                    student_name,
+                    company,
+                    hr_email,
+                    cid,
+                    normalize_export_cell(c.subject or "", max_len=500),
+                    c.status or "",
+                    c.email_type or "",
+                    c.reply_status or "",
+                    _reply_preview_truncated(c),
+                    c.reply_detected_at or c.replied_at or "",
+                    _export_thread_id(c),
+                    c.sent_at or "",
+                    normalize_export_cell(c.reply_from or "", max_len=500),
+                    normalize_export_cell(getattr(c, "reply_type", None) or (c.reply_status or ""), max_len=64),
+                    normalize_export_cell(getattr(c, "sequence_state", None) or "", max_len=64),
+                ],
+                expected_len=len(_HEADER_REPLIES),
+            )
+            pending.append((c, row))
+
+        if pending:
+            append_rows_batched_with_retry(replies_ws, [r for _, r in pending])
+            for c, _ in pending:
+                c.exported_to_sheet = True
+                db.add(c)
+            db.commit()
+
+        return {
+            "ok": True,
+            "action": "rebuilt",
+            "backup_title": backup_title if raw else None,
+            "header_mismatch": bool(header_mismatch),
+            "width_exceeds": bool(width_exceeds),
+            "rows_backfilled": int(len(pending)),
+            "canonical_width": int(len(canonical)),
+        }
 
 
 def test_sheet():

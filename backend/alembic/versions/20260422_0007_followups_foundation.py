@@ -17,19 +17,21 @@ depends_on = None
 
 def upgrade() -> None:
     # 1) student_templates table (safe storage of per-student templates)
-    op.create_table(
-        "student_templates",
-        sa.Column("id", sa.String(36), primary_key=True, nullable=False),
-        sa.Column("student_id", sa.String(36), sa.ForeignKey("students.id"), nullable=False),
-        sa.Column("template_type", sa.String(20), nullable=False),  # INITIAL | FOLLOWUP_1..3
-        sa.Column("subject", sa.Text(), nullable=False),
-        sa.Column("body", sa.Text(), nullable=False),
-        sa.Column("created_at", sa.DateTime(), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
-        sa.UniqueConstraint("student_id", "template_type", name="uq_student_templates_student_type"),
-    )
+    bind = op.get_bind()
+    insp = sa.inspect(bind)
+    if not insp.has_table("student_templates"):
+        op.create_table(
+            "student_templates",
+            sa.Column("id", sa.String(36), primary_key=True, nullable=False),
+            sa.Column("student_id", sa.String(36), sa.ForeignKey("students.id"), nullable=False),
+            sa.Column("template_type", sa.String(20), nullable=False),  # INITIAL | FOLLOWUP_1..3
+            sa.Column("subject", sa.Text(), nullable=False),
+            sa.Column("body", sa.Text(), nullable=False),
+            sa.Column("created_at", sa.DateTime(), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")),
+            sa.UniqueConstraint("student_id", "template_type", name="uq_student_templates_student_type"),
+        )
 
     # 2) email_campaigns additions (do not change existing semantics)
-    bind = op.get_bind()
     dialect = getattr(bind, "dialect", None)
     name = getattr(dialect, "name", "") if dialect else ""
 
@@ -66,9 +68,11 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     # Reverse is best-effort: we drop the new table and follow_up_step column.
-    op.drop_table("student_templates")
-
     bind = op.get_bind()
+    insp = sa.inspect(bind)
+    if insp.has_table("student_templates"):
+        op.drop_table("student_templates")
+
     name = getattr(getattr(bind, "dialect", None), "name", "") if bind else ""
     if name == "postgresql":
         op.execute("ALTER TABLE email_campaigns DROP COLUMN IF EXISTS follow_up_step;")

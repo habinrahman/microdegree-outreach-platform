@@ -9,6 +9,7 @@ from sqlalchemy.exc import OperationalError, PendingRollbackError
 from sqlalchemy.orm import Session
 
 from app.database.config import SessionLocal
+from app.database.session_resilience import recover_db_session
 from app.models import EmailCampaign, Student
 from app.services.campaign_cancel import cancel_followups_for_hr_response
 from app.services.reply_classifier import apply_inbound_reply_to_campaign
@@ -22,12 +23,9 @@ _MAX_REPLY_TEXT_LEN = 100_000
 _SESSION_RESET_ERRORS = (OperationalError, PendingRollbackError)
 
 
-def _rollback_db_session(db: Session) -> None:
+def _rollback_db_session(db: Session, exc: BaseException | None = None) -> None:
     """Clear aborted transaction so the same Session can be reused (PgBouncer drops)."""
-    try:
-        db.rollback()
-    except Exception:
-        pass
+    recover_db_session(db, exc if isinstance(exc, OperationalError) else None, log=logger)
 
 
 def _canonical_message_id(value: str | None) -> str | None:
@@ -82,8 +80,8 @@ def check_replies_for_student(db: Session, student: Student) -> int:
             )
             .all()
         )
-    except _SESSION_RESET_ERRORS:
-        _rollback_db_session(db)
+    except _SESSION_RESET_ERRORS as e:
+        _rollback_db_session(db, e)
         raise
     by_mid: dict[str, EmailCampaign] = {}
     for c in candidates:
@@ -95,7 +93,7 @@ def check_replies_for_student(db: Session, student: Student) -> int:
                 by_mid[key] = c
 
     matched = 0
-    now = utc_now()
+    capture_now = utc_now()
     pairs: set[tuple] = set()
 
     for msg in messages:
@@ -140,13 +138,14 @@ def check_replies_for_student(db: Session, student: Student) -> int:
         if not body:
             continue
 
+        received_at = msg.get("received_at") or capture_now
         result = apply_inbound_reply_to_campaign(
             db,
             campaign,
             body[:_MAX_REPLY_TEXT_LEN],
             sender_for_classify=sender_lower,
             reply_from_header=from_header,
-            when=now,
+            when=received_at,
             inbound_message_id=msg.get("message_id"),
         )
         if result == "IGNORED":
@@ -200,7 +199,7 @@ def check_replies(*, max_students: int = 50) -> dict:
                     getattr(student, "gmail_address", None),
                     e,
                 )
-                _rollback_db_session(db)
+                _rollback_db_session(db, e)
         out = {"ok": True, "students_scanned": len(students), "campaigns_marked_replied": total}
         try:
             from app.services.observability_metrics import inc, observe_latency
@@ -211,5 +210,15 @@ def check_replies(*, max_students: int = 50) -> dict:
         except Exception:
             pass
         return out
+    except OperationalError as e:
+        recover_db_session(db, e, log=logger)
+        logger.warning(
+            "reply_tracker: database unavailable (will retry next tick): %s",
+            e,
+        )
+        raise
+    except PendingRollbackError:
+        recover_db_session(db, None, log=logger)
+        raise
     finally:
         db.close()

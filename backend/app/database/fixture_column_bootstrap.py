@@ -11,9 +11,66 @@ import logging
 from typing import Any
 
 from sqlalchemy import text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
+
+from app.database.bootstrap_ddl import bootstrap_ddl_statement_timeout_ms
 
 logger = logging.getLogger(__name__)
+
+
+def _fixture_bootstrap_already_satisfied(before: dict[str, Any], dialect: str) -> bool:
+    """True when fixture columns exist and are NOT NULL (no DDL needed)."""
+    if not before.get("fixture_columns_present"):
+        return False
+    if dialect != "postgresql":
+        return True
+    details = before.get("details") or {}
+    for tbl in ("students", "hr_contacts"):
+        d = details.get(tbl) or {}
+        if str(d.get("is_nullable", "")).upper() != "NO":
+            return False
+    return True
+
+
+def _pg_has_fixture_column(conn: Connection, table: str) -> bool:
+    r = conn.execute(
+        text(
+            """
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = :t
+              AND column_name = 'is_fixture_test_data'
+            LIMIT 1
+            """
+        ),
+        {"t": table},
+    ).fetchone()
+    return r is not None
+
+
+def _pg_fixture_column_not_null(conn: Connection, table: str) -> bool:
+    r = conn.execute(
+        text(
+            """
+            SELECT is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = :t
+              AND column_name = 'is_fixture_test_data'
+            LIMIT 1
+            """
+        ),
+        {"t": table},
+    ).fetchone()
+    return r is not None and str(r[0]).upper() == "NO"
+
+
+def _pg_has_null_fixture_values(conn: Connection, table: str) -> bool:
+    r = conn.execute(
+        text(f'SELECT 1 FROM "{table}" WHERE is_fixture_test_data IS NULL LIMIT 1')
+    ).fetchone()
+    return r is not None
 
 
 def verify_fixture_columns(engine: Engine) -> dict[str, Any]:
@@ -69,8 +126,34 @@ def _apply_postgres(engine: Engine) -> None:
         "ALTER TABLE hr_contacts ALTER COLUMN is_fixture_test_data SET DEFAULT FALSE",
         "ALTER TABLE hr_contacts ALTER COLUMN is_fixture_test_data SET NOT NULL",
     ]
-    with engine.begin() as conn:
-        for stmt in stmts:
+    # One transaction per statement: ``statement_timeout`` on a heavy ALTER must not poison the batch.
+    _to_ms = bootstrap_ddl_statement_timeout_ms()
+    for stmt in stmts:
+        with engine.begin() as conn:
+            conn.execute(text(f"SET LOCAL statement_timeout = {_to_ms}"))
+            # Skip work that is already true in metadata — avoids lock waits on hot tables (Supabase pooler).
+            if "students ADD COLUMN IF NOT EXISTS is_fixture_test_data" in stmt:
+                if _pg_has_fixture_column(conn, "students"):
+                    continue
+            if "hr_contacts ADD COLUMN IF NOT EXISTS is_fixture_test_data" in stmt:
+                if _pg_has_fixture_column(conn, "hr_contacts"):
+                    continue
+            if stmt.startswith("UPDATE students SET is_fixture_test_data"):
+                if not _pg_has_fixture_column(conn, "students"):
+                    continue
+                if not _pg_has_null_fixture_values(conn, "students"):
+                    continue
+            if stmt.startswith("UPDATE hr_contacts SET is_fixture_test_data"):
+                if not _pg_has_fixture_column(conn, "hr_contacts"):
+                    continue
+                if not _pg_has_null_fixture_values(conn, "hr_contacts"):
+                    continue
+            if "students ALTER COLUMN is_fixture_test_data SET NOT NULL" in stmt:
+                if not _pg_has_fixture_column(conn, "students") or _pg_fixture_column_not_null(conn, "students"):
+                    continue
+            if "hr_contacts ALTER COLUMN is_fixture_test_data SET NOT NULL" in stmt:
+                if not _pg_has_fixture_column(conn, "hr_contacts") or _pg_fixture_column_not_null(conn, "hr_contacts"):
+                    continue
             conn.execute(text(stmt))
 
 
@@ -102,6 +185,16 @@ def ensure_fixture_columns_bootstrap(
         return {"before": before, "after": before, "changed": False, "verify_only": True}
 
     dialect = engine.dialect.name
+    if _fixture_bootstrap_already_satisfied(before, dialect):
+        logger.info("ensure_fixture_columns_bootstrap: schema already satisfied; skipping DDL")
+        return {
+            "before": before,
+            "after": before,
+            "changed": False,
+            "verify_only": False,
+            "skipped": True,
+        }
+
     try:
         if dialect == "postgresql":
             _apply_postgres(engine)
@@ -120,5 +213,5 @@ def ensure_fixture_columns_bootstrap(
         changed = not bool(before.get("fixture_columns_present"))
         return {"before": before, "after": after, "changed": changed, "verify_only": False}
     except Exception:
-        logger.exception("ensure_fixture_columns_bootstrap failed (strict mode)")
+        logger.exception("ensure_fixture_columns_bootstrap failed")
         raise

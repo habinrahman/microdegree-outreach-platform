@@ -24,6 +24,8 @@ from app.services.student_email_health import (
 from app.services.sheet_sync_trigger import trigger_sheet_sync_async
 from app.services.campaign_lifecycle import assert_legal_email_campaign_transition
 from app.services.deliverability_layer import evaluate_deliverability_for_send
+from app.services.runtime_settings_store import get_outbound_enabled
+from app.services.outbound_suppression_store import is_suppressed
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +146,18 @@ def send_one(
         return {"ok": False, "message": "Student or HR not found"}
     if not student.app_password:
         return {"ok": False, "message": "Student has no app_password configured for SMTP"}
+
+    # Global outbound kill switch (manual send path). Do not claim/send.
+    if not get_outbound_enabled(db):
+        return {"ok": False, "message": "Outbound sending is currently disabled (outbound_enabled=false)"}
+
+    # Suppression list (manual send path).
+    try:
+        blocked, reason = is_suppressed(db, getattr(hr, "email", "") or "")
+    except Exception:
+        blocked, reason = True, "suppression_check_error"
+    if blocked:
+        return {"ok": False, "message": f"Recipient suppressed: {reason or 'blocked'}", "suppressed": True}
 
     existing = (
         db.query(EmailCampaign)

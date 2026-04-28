@@ -8,7 +8,10 @@ import logging
 import uuid
 from sqlalchemy import create_engine, String, text
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import OperationalError, PendingRollbackError
+
+from app.database.bootstrap_ddl import bootstrap_ddl_statement_timeout_ms
+from app.database.session_resilience import recover_db_session
 from sqlalchemy.types import TypeDecorator, CHAR
 
 logger = logging.getLogger(__name__)
@@ -82,6 +85,12 @@ def get_db():
     db = SessionLocal()
     try:
         yield db
+    except OperationalError as e:
+        recover_db_session(db, e, log=logger)
+        raise
+    except PendingRollbackError:
+        recover_db_session(db, None, log=logger)
+        raise
     finally:
         db.close()
 
@@ -286,7 +295,8 @@ def _ensure_postgres_columns():
     Lightweight schema upgrade for Postgres deployments.
     SQLAlchemy create_all won't add new columns to existing tables, so we add the columns we rely on.
 
-    Uses one introspection query + one DDL transaction (avoids N sequential connects — major latency on remote DB).
+    Each DDL runs in its own transaction so a timeout or error on one statement does not leave the
+    connection in ``InFailedSqlTransaction`` for the rest (Supabase ``statement_timeout`` is common).
     """
     alters_spec: list[tuple[str, str, str]] = [
         ("email_campaigns", "message_id", "ALTER TABLE email_campaigns ADD COLUMN message_id TEXT"),
@@ -421,26 +431,56 @@ def _ensure_postgres_columns():
     existing = {(str(r[0]).lower(), str(r[1]).lower()) for r in rows}
     stmts = [ddl for (tbl, col, ddl) in alters_spec if (tbl.lower(), col.lower()) not in existing]
 
+    _ddl_to_ms = bootstrap_ddl_statement_timeout_ms()
+    for stmt in stmts:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(f"SET LOCAL statement_timeout = {_ddl_to_ms}"))
+                conn.execute(text(stmt))
+        except Exception as e:
+            logger.warning("Postgres column DDL skipped for one statement: %s", e)
+
+    def _pg_named_unique_constraint_exists(conn, table: str, conname: str) -> bool:
+        row = conn.execute(
+            text(
+                """
+                SELECT 1
+                FROM pg_constraint c
+                JOIN pg_class t ON t.oid = c.conrelid
+                JOIN pg_namespace n ON n.oid = t.relnamespace
+                WHERE n.nspname = current_schema()
+                  AND t.relname = :tbl
+                  AND c.conname = :cname
+                LIMIT 1
+                """
+            ),
+            {"tbl": table, "cname": conname},
+        ).fetchone()
+        return row is not None
+
+    # Allow multiple campaigns per student–HR; uniqueness is per sequence_number.
+    # Isolated transactions: a failed DROP must not abort CREATE INDEX on the same connection.
+    _ddl_to_ms = bootstrap_ddl_statement_timeout_ms()
     try:
         with engine.begin() as conn:
-            for stmt in stmts:
-                conn.execute(text(stmt))
-            # Allow multiple campaigns per student–HR; uniqueness is per sequence_number.
-            # Try to remove legacy uniqueness if present; ignore if missing/no permission.
-            try:
-                conn.execute(text("ALTER TABLE email_campaigns DROP CONSTRAINT IF EXISTS uq_email_campaigns_student_hr"))
-            except Exception:
-                pass
-            try:
-                conn.execute(text("DROP INDEX IF EXISTS uq_email_campaigns_student_hr"))
-            except Exception:
-                pass
-            conn.execute(
-                text(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_email_campaigns_student_hr_seq "
-                    "ON email_campaigns (student_id, hr_id, sequence_number)"
+            conn.execute(text(f"SET LOCAL statement_timeout = {_ddl_to_ms}"))
+            if _pg_named_unique_constraint_exists(conn, "email_campaigns", "uq_email_campaigns_student_hr"):
+                conn.execute(
+                    text("ALTER TABLE email_campaigns DROP CONSTRAINT IF EXISTS uq_email_campaigns_student_hr")
                 )
-            )
     except Exception as e:
-        # Permissions / existing duplicates / partial migration
-        logger.warning("Postgres schema migration skipped or partial: %s", e)
+        logger.warning("Postgres index/uniqueness step skipped: %s", e)
+
+    for idx_stmt in (
+        "DROP INDEX IF EXISTS uq_email_campaigns_student_hr",
+        (
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_email_campaigns_student_hr_seq "
+            "ON email_campaigns (student_id, hr_id, sequence_number)"
+        ),
+    ):
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(f"SET LOCAL statement_timeout = {_ddl_to_ms}"))
+                conn.execute(text(idx_stmt))
+        except Exception as e:
+            logger.warning("Postgres index/uniqueness step skipped: %s", e)

@@ -1,7 +1,11 @@
 """IMAP helpers for per-student inbox reads (Gmail app password)."""
+from __future__ import annotations
+
+from datetime import timezone
 import imaplib
 import re
 from email import message_from_bytes
+from email.utils import parsedate_to_datetime
 from email.message import Message
 from typing import Any
 
@@ -81,7 +85,7 @@ def fetch_messages(
 
     slice_nums = message_nums[-tail:] if len(message_nums) > tail else message_nums
     for num in slice_nums:
-        status, data = mail.fetch(num, "(RFC822)")
+        status, data = mail.fetch(num, "(RFC822 INTERNALDATE)")
         if status != "OK" or not data or not data[0]:
             continue
 
@@ -92,6 +96,27 @@ def fetch_messages(
 
         msg = message_from_bytes(bytes(raw))
         body_plain = _extract_plain_body(msg)
+        received_at = None
+        try:
+            # Prefer server-side INTERNALDATE (best-effort parse from FETCH response metadata).
+            if isinstance(payload, tuple) and payload and isinstance(payload[0], (bytes, bytearray)):
+                meta = bytes(payload[0]).decode(errors="ignore")
+                m = re.search(r'INTERNALDATE\s+"([^"]+)"', meta)
+                if m:
+                    received_at = parsedate_to_datetime(m.group(1))
+        except Exception:
+            received_at = None
+        if received_at is None:
+            try:
+                # Fall back to RFC Date header (may be missing / forged, but better than capture time).
+                h = msg.get("Date")
+                received_at = parsedate_to_datetime(h) if h else None
+            except Exception:
+                received_at = None
+        if received_at is not None:
+            if received_at.tzinfo is None:
+                received_at = received_at.replace(tzinfo=timezone.utc)
+            received_at = received_at.astimezone(timezone.utc)
         results.append(
             {
                 "subject": msg.get("Subject"),
@@ -100,6 +125,7 @@ def fetch_messages(
                 "references": msg.get("References"),
                 "message_id": msg.get("Message-ID"),
                 "body_plain": body_plain,
+                "received_at": received_at,
             }
         )
 

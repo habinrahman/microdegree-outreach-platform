@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.auth import require_api_key
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, not_, or_
+from sqlalchemy import and_, not_, or_, func, String
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -123,12 +123,54 @@ def list_replies(
     include_demo: bool = False,
     db: Session = Depends(get_db),
 ):
+    # Thread rollup: last activity is important for inbox-style sorting / context.
+    # Use coalesced thread identifier so legacy rows still group somewhat predictably.
+    thread_key = func.coalesce(
+        EmailCampaign.thread_id,
+        EmailCampaign.gmail_thread_id,
+        EmailCampaign.message_id,
+        func.cast(EmailCampaign.id, String()),
+    )
+    _reply_ts = func.coalesce(
+        EmailCampaign.reply_received_at,
+        EmailCampaign.replied_at,
+        EmailCampaign.reply_detected_at,
+    )
+    thread_rollup = (
+        db.query(
+            thread_key.label("thread_key"),
+            func.max(_reply_ts).label("thread_last_reply_at"),
+            func.max(EmailCampaign.sent_at).label("thread_last_sent_at"),
+            func.max(
+                func.coalesce(
+                    EmailCampaign.reply_received_at,
+                    EmailCampaign.replied_at,
+                    EmailCampaign.reply_detected_at,
+                    EmailCampaign.sent_at,
+                    EmailCampaign.created_at,
+                )
+            ).label("thread_last_activity_at"),
+        )
+        .group_by(thread_key)
+        .subquery()
+    )
+
     q = (
-        db.query(EmailCampaign, Student, HRContact)
+        db.query(EmailCampaign, Student, HRContact, thread_rollup.c.thread_last_activity_at)
         .select_from(EmailCampaign)
         .join(Student, EmailCampaign.student_id == Student.id)
         .join(HRContact, EmailCampaign.hr_id == HRContact.id)
-        .filter(EmailCampaign.reply_text.isnot(None))
+        .join(
+            thread_rollup,
+            thread_rollup.c.thread_key
+            == func.coalesce(
+                EmailCampaign.thread_id,
+                EmailCampaign.gmail_thread_id,
+                EmailCampaign.message_id,
+                func.cast(EmailCampaign.id, String()),
+            ),
+        )
+        .filter(EmailCampaign.reply_text.isnot(None), EmailCampaign.replied.is_(True))
     )
     if not include_demo:
         q = q.filter(Student.is_demo.is_(False), HRContact.is_demo.is_(False))
@@ -142,7 +184,10 @@ def list_replies(
             q = q.filter(clause)
 
     q = q.order_by(
+        EmailCampaign.reply_received_at.desc().nullslast(),
+        EmailCampaign.replied_at.desc().nullslast(),
         EmailCampaign.reply_detected_at.desc().nullslast(),
+        thread_rollup.c.thread_last_activity_at.desc().nullslast(),
         EmailCampaign.created_at.desc(),
     ).limit(500)
 
@@ -150,10 +195,17 @@ def list_replies(
         logger.info("Fetching replies...")
         rows = q.all()
         out = []
-        for ec, st, hr in rows:
-            reply_time = ec.reply_detected_at or ec.replied_at
+        for ec, st, hr, thread_last_activity_at in rows:
+            received_at = getattr(ec, "reply_received_at", None) or ec.replied_at
+            captured_at = ec.reply_detected_at
             rt = canonical_reply_type_for_api(ec)
             wf = getattr(ec, "reply_workflow_status", None) or "OPEN"
+            days_to_reply = None
+            if received_at is not None and ec.sent_at is not None:
+                try:
+                    days_to_reply = (received_at - ec.sent_at).total_seconds() / 86400.0
+                except Exception:
+                    days_to_reply = None
             out.append(
                 {
                     "reply_type": rt,
@@ -162,13 +214,24 @@ def list_replies(
                     "student_name": st.name,
                     "company": hr.company,
                     "hr_email": hr.email,
-                    "time": _dt_iso(reply_time),
+                    "reply_received_at": _dt_iso(getattr(ec, "reply_received_at", None)),
+                    "received_at": _dt_iso(received_at),
+                    "captured_at": _dt_iso(captured_at),
+                    "time": _dt_iso(received_at or captured_at),
                     "created_at": _dt_iso(ec.created_at),
                     "campaign_id": str(ec.id),
                     "student_id": str(st.id),
                     "subject": ec.subject,
                     "email_type": ec.email_type,
+                    "sequence_number": ec.sequence_number,
+                    "sent_at": _dt_iso(ec.sent_at),
                     "reply_from": ec.reply_from,
+                    "message_id": ec.message_id,
+                    "thread_id": ec.thread_id,
+                    "gmail_thread_id": ec.gmail_thread_id,
+                    "last_reply_message_id": ec.last_reply_message_id,
+                    "thread_last_activity": _dt_iso(thread_last_activity_at),
+                    "days_to_reply": days_to_reply,
                     "status": wf,
                     "notes": getattr(ec, "reply_admin_notes", None),
                 }
@@ -202,14 +265,18 @@ def patch_reply_triage(
     st = db.query(Student).filter(Student.id == ec.student_id).first()
     hr = db.query(HRContact).filter(HRContact.id == ec.hr_id).first()
     rt = canonical_reply_type_for_api(ec)
-    reply_time = ec.reply_detected_at or ec.replied_at
+    received_at = getattr(ec, "reply_received_at", None) or ec.replied_at
+    captured_at = ec.reply_detected_at
     return {
         "reply_type": rt,
         "reply_message": ec.reply_text,
         "student_name": st.name if st else None,
         "company": hr.company if hr else None,
         "hr_email": hr.email if hr else None,
-        "time": _dt_iso(reply_time),
+        "reply_received_at": _dt_iso(getattr(ec, "reply_received_at", None)),
+        "received_at": _dt_iso(received_at),
+        "captured_at": _dt_iso(captured_at),
+        "time": _dt_iso(received_at or captured_at),
         "campaign_id": str(ec.id),
         "student_id": str(st.id) if st else None,
         "status": getattr(ec, "reply_workflow_status", None) or "OPEN",

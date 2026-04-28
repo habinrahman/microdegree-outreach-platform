@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from app.models.runtime_setting import RuntimeSetting
 from app.services.runtime_settings_bootstrap import (
     KEY_FOLLOWUPS_DISPATCH,
+    KEY_OUTBOUND_ENABLED,
     ensure_runtime_settings_schema_for_engine,
 )
 
@@ -140,3 +141,49 @@ def set_followups_dispatch_enabled(db: Session, enabled: bool) -> None:
         db.add(row)
     db.commit()
     logger.info("runtime_settings: followups_dispatch_enabled=%s", val)
+
+
+def get_outbound_enabled(db: Session) -> bool:
+    """
+    Global kill switch for *any* outbound email dispatch (scheduler + manual sends).
+
+    - Missing table: fail-open to True (maintains compatibility in partially migrated envs).
+    - Missing row: defaults to True.
+    - Read error (unexpected): fail-closed to False (safer than sending while blind).
+    """
+    if not _runtime_settings_table_exists(db):
+        logger.warning("runtime_settings: table missing; fail-open outbound_enabled=True")
+        return True
+    try:
+        raw = _get_raw(db, KEY_OUTBOUND_ENABLED)
+    except Exception as exc:
+        if _missing_runtime_settings_table(exc):
+            logger.warning("runtime_settings: missing-table signature; fail-open outbound_enabled=True: %s", exc)
+            return True
+        logger.exception("runtime_settings: outbound_enabled read failed; fail-closed")
+        return False
+    if raw is None or raw == "":
+        return True
+    return raw.lower() in ("1", "true", "yes", "on")
+
+
+def set_outbound_enabled(db: Session, enabled: bool) -> None:
+    val = "true" if enabled else "false"
+    if not _runtime_settings_table_exists(db):
+        from app.database.config import engine
+
+        ensure_runtime_settings_schema_for_engine(engine)
+        try:
+            db.expire_all()
+        except Exception:
+            pass
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    row = db.query(RuntimeSetting).filter(RuntimeSetting.key == KEY_OUTBOUND_ENABLED).first()
+    if row is None:
+        db.add(RuntimeSetting(key=KEY_OUTBOUND_ENABLED, value=val, updated_at=now))
+    else:
+        row.value = val
+        row.updated_at = now
+        db.add(row)
+    db.commit()
+    logger.info("runtime_settings: outbound_enabled=%s", val)

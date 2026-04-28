@@ -530,6 +530,8 @@ def send_followup(
     from app.services.outreach_service import send_one_immediate
     from app.utils.email_campaign_persist import persist_sent_email_campaign
     from app.services.audit import log_event
+    from app.services.runtime_settings_store import get_outbound_enabled
+    from app.services.outbound_suppression_store import is_suppressed
 
     if not FOLLOWUPS_ENABLED:
         raise HTTPException(status_code=409, detail="Follow-ups disabled (FOLLOWUPS_ENABLED=0)")
@@ -560,6 +562,15 @@ def send_followup(
     hr = db.query(HRContact).filter(HRContact.id == hid, HRContact.is_valid.is_(True)).first()
     if st is None or hr is None:
         raise HTTPException(status_code=404, detail="Student or HR not found")
+
+    # Global outbound kill switch (follow-up immediate send).
+    if not get_outbound_enabled(db):
+        raise HTTPException(status_code=409, detail="Outbound sending is disabled (outbound_enabled=false)")
+
+    # Suppression list (follow-up immediate send).
+    blocked, reason = is_suppressed(db, getattr(hr, "email", "") or "")
+    if blocked:
+        raise HTTPException(status_code=409, detail=f"Recipient suppressed: {reason or 'blocked'}")
 
     # Locate follow-up campaign row for this step (sequence_number = step+1).
     seq = int(state.next_followup_step) + 1

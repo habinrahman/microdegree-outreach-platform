@@ -202,11 +202,13 @@ def apply_inbound_reply_to_campaign(
         if sub in ("BOUNCED", "BLOCKED"):
             campaign.replied = False
             campaign.replied_at = None
+            campaign.reply_received_at = None
             assert_legal_email_campaign_transition(campaign.status, "failed", context="reply_classifier/bounce-hard")
             campaign.status = "failed"
         else:
             campaign.replied = False
             campaign.replied_at = None
+            campaign.reply_received_at = None
             assert_legal_email_campaign_transition(campaign.status, "sent", context="reply_classifier/bounce-soft")
             campaign.status = "sent"
 
@@ -250,6 +252,7 @@ def apply_inbound_reply_to_campaign(
     campaign.reply_type = rtype
     campaign.replied = True
     campaign.replied_at = when
+    campaign.reply_received_at = when
     assert_legal_email_campaign_transition(campaign.status, "replied", context="reply_classifier/human-reply")
     campaign.status = "replied"
     db.add(campaign)
