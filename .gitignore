@@ -139,6 +139,7 @@ dump.rdb
 *.db-shm
 *.db-wal
 microdegree_outreach.db
+readme-demo.db
 **/microdegree*.db
 
 # --- Backups & exports (operator artifacts) ---

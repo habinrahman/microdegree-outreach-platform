@@ -11,6 +11,10 @@
 
 **MicroDegree Outreach** is an internal-grade **placement / HR outreach automation** system: it models students and HR contacts, assigns outreach pairs, generates **sequenced email campaigns** (initial + timed follow-ups), runs an **APScheduler**-driven send pipeline (Gmail API with SMTP fallback), **detects replies** over IMAP/Gmail monitoring, classifies outcomes, exports a **mirror** to **Google Sheets**, and exposes a **React operator console** with analytics, admin tools, and **SRE-style reliability** surfaces.
 
+![Outreach operator console demo](docs/demo/demo.gif)
+
+<p align="center"><em>Dashboard → Campaigns → Replies → Outreach. Re-record: <code>cd scripts && npm run record:demo</code></em></p>
+
 The codebase is engineered for **controlled pilots**: explicit env kill-switches, lifecycle FSMs on `email_campaigns`, idempotent worker claims, fixture isolation in CI, and extensive runbooks under `docs/`.
 
 > **Data & privacy:** This repository does **not** ship real student or HR data. Production databases, OAuth tokens, `credentials.json` / service accounts, and exports are **operator-owned** and must stay out of git (see `.gitignore`). The ORM includes `is_demo` and `include_demo` query flags so UIs can hide synthetic rows. **Google Sheets** mirror reads **`GOOGLE_SHEETS_SPREADSHEET_ID`** and a service-account JSON path from env (see `backend/.env.example`); do not commit real workbook IDs or keys if the repo is public.

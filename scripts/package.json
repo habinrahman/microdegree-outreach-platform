@@ -1,0 +1,13 @@
+{
+  "name": "outreach-demo-scripts",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "record:demo": "node record-demo.mjs"
+  },
+  "dependencies": {
+    "gifenc": "^1.0.3",
+    "playwright": "^1.61.1",
+    "pngjs": "^7.0.0"
+  }
+}
